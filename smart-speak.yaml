@@ -586,9 +586,10 @@ micro_wake_word:
     microphone: i2s_mics
     channels: $which_mic
   stop_after_detection: false
+  # Every loaded model runs inference on every frame, so an unused one is pure
+  # CPU cost on the path that is already the tightest. okay_nabu was dropped
+  # for that reason; add it back only if you actually say it.
   models:
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
-      id: okay_nabu
     - model: hey_jarvis
       id: hey_jarvis
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
@@ -1003,14 +1004,23 @@ select:
       - Slightly sensitive
       - Moderately sensitive
       - Very sensitive
+    # Cutoffs are uint8, quantising probability 0.0-1.0 onto 0-255, so these are
+    # roughly 0.85 / 0.69 / 0.20. This used to set them on okay_nabu, which is
+    # no longer loaded - the entity moved but never followed the model, so it
+    # had been adjusting nothing for a while.
+    #
+    # The internal "stop" model is deliberately left at its own default: it is
+    # only enabled while the device is talking, and making it more sensitive
+    # here would cut off replies, which is a different tradeoff from how eagerly
+    # the device should wake up.
     on_value:
       lambda: |-
         if (x == "Slightly sensitive") {
-          id(okay_nabu).set_probability_cutoff(217);
+          id(hey_jarvis).set_probability_cutoff(217);
         } else if (x == "Moderately sensitive") {
-          id(okay_nabu).set_probability_cutoff(176);
+          id(hey_jarvis).set_probability_cutoff(176);
         } else if (x == "Very sensitive") {
-          id(okay_nabu).set_probability_cutoff(50);
+          id(hey_jarvis).set_probability_cutoff(50);
         }
   - platform: logger
     id: logger_select
