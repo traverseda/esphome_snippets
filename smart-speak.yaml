@@ -1248,23 +1248,15 @@ sensor:
     entity_category: diagnostic
     update_interval: 60s
 
-  # Rides on the capture micro_wake_word already runs - passive: true means it
-  # never starts the mic itself, so it costs a buffer and no extra I2S traffic.
-  # Values are relative dB, where 0 is the loudest the ES7210 can register.
-  # Muting the mic zeroes the ADC gain, so a muted device reads as silence.
-  - platform: sound_level
-    microphone:
-      microphone: i2s_mics
-      channels: $which_mic
-    passive: true
-    measurement_duration: 1000ms
-    rms:
-      name: "Ambient sound level"
-      id: ambient_sound_level
-    peak:
-      name: "Peak sound level"
-      id: peak_sound_level
-      disabled_by_default: true
+  # REMOVED: a sound_level sensor tapping i2s_mics. passive: true keeps it from
+  # starting the mic, but it still registers a second MicrophoneSource on the
+  # same capture, so every audio chunk gets copied and RMS/peak-summed on the
+  # mic's delivery path before micro_wake_word sees it. mWW feeds a streaming
+  # model - it degrades from dropped or late frames, not just from bad gain -
+  # and this was the only change to the audio path in this config, so it is the
+  # prime suspect for wake-word detection getting worse. Do not re-add it
+  # without A/B-ing detection rate; use "Ambient sound level" from a separate
+  # device if you want room-noise telemetry.
 
 text_sensor:
   - platform: template
