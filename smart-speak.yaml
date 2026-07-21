@@ -774,20 +774,24 @@ script:
             return;
           }
 
-          // Violet = the turn is yours, blue = the device is talking back.
-          // Motion carries the phase within violet, since speed alone is too
+          // Purple = the turn is yours, blue = the device is talking back.
+          // Motion carries the phase within purple, since speed alone is too
           // subtle to read across a room: steady means it is waiting on you,
           // fast pulse means it hears you, rotation means it is working.
           // Timers and alarms own green, on the same steady/fast split.
+          // The purple is rgb(255, 28, 241) - measured off the ring, not
+          // derived. The previous 0.55/0.0/1.0 read as blue, because a WS2812's
+          // blue die is far brighter than its red at equal PWM. All three
+          // phases share the one hue; the effect is what tells them apart.
           switch (phase) {
             case ${voice_assist_waiting_for_command_phase_id}:
-              set("solid", 0.55, 0.0, 1.0);           // awake, waiting for you
+              set("solid", 1.0, 0.11, 0.945);         // awake, waiting for you
               return;
             case ${voice_assist_listening_for_command_phase_id}:
-              set("Pulse Fast", 0.8, 0.2, 1.0);       // hearing you speak
+              set("Pulse Fast", 1.0, 0.11, 0.945);    // hearing you speak
               return;
             case ${voice_assist_thinking_phase_id}:
-              set("Comet", 0.55, 0.0, 1.0);           // spinning = working
+              set("Comet", 1.0, 0.11, 0.945);         // spinning = working
               return;
             case ${voice_assist_replying_phase_id}:
               set("Pulse Slow", 0.0, 0.35, 1.0);      // its turn to talk
