@@ -89,6 +89,13 @@ esphome:
         - lambda: |-
             setenv("TZ", id(saved_time_zone).c_str(), 1);
             tzset();
+        # Seed the system clock from the onboard RTC before HA is reachable, so
+        # the alarm survives an HA restart. Runs after the TZ restore above so
+        # the first published time is already local. With no backup cell the
+        # chip's oscillator-stop flag is set after a power cut and the component
+        # declines to sync, leaving HA the only source - i.e. today's behaviour.
+        - pcf85063.read_time: hw_rtc
+        - script.execute: publish_current_time
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -129,8 +136,10 @@ wifi:
   on_disconnect:
     - script.execute: control_leds
 
+# This interval drives the debug sensors below, not just the log line - at 5s
+# they'd write seven states a minute each into HA's recorder for no benefit.
 debug:
-  update_interval: 5s
+  update_interval: 60s
 
 logger:
   level: DEBUG
@@ -203,6 +212,20 @@ time:
           - script.execute: check_alarm
     on_time_sync:
       - script.execute: publish_current_time
+      # HA stays authoritative; push its time down so the chip is correct for
+      # the next cold boot. Declines to write if system time is itself invalid.
+      - pcf85063.write_time:
+          id: hw_rtc
+
+  # Onboard PCF85063 (I2C 0x51), kept as a fallback rather than a peer:
+  # update_interval: never, because polling would let the chip's drift overwrite
+  # HA's accurate time every 15 minutes. Read once at boot, written on HA sync.
+  # Absent or unreadable, it marks itself failed and nothing else is affected.
+  - platform: pcf85063
+    id: hw_rtc
+    i2c_id: internal_i2c
+    address: 0x51
+    update_interval: never
 
 light:
   - platform: esp32_rmt_led_strip
@@ -238,6 +261,29 @@ light:
           width: 7
       - addressable_color_wipe:
           name: "Wipe"
+      # A single lit pixel chasing around the ring with a short fading tail.
+      # Rotation reads as "busy" at a glance, which no pulse speed does.
+      - addressable_lambda:
+          name: "Comet"
+          update_interval: 70ms
+          lambda: |-
+            static int head = 0;
+            if (initial_run) head = 0;
+            const int n = it.size();
+            for (int i = 0; i < n; i++) {
+              const int behind = (head - i + n) % n;  // 0 at the head
+              float level;
+              switch (behind) {
+                case 0: level = 1.00f; break;
+                case 1: level = 0.40f; break;
+                case 2: level = 0.12f; break;
+                default: level = 0.02f; break;
+              }
+              it[i] = Color((uint8_t) (current_color.red * level),
+                            (uint8_t) (current_color.green * level),
+                            (uint8_t) (current_color.blue * level));
+            }
+            head = (head + 1) % n;
 
 i2s_audio:
   - id: i2s_output
@@ -673,12 +719,15 @@ script:
                 condition:
                   lambda: 'return effect == "solid";'
                 then:
+                  # "None" clears whatever effect was running - light.turn_on
+                  # without it leaves the old effect animating in a new colour.
                   - light.turn_on:
                       id: status_ring
                       brightness: !lambda 'return id(led_ring_brightness).state;'
                       red: !lambda 'return id(led_ring_color_r);'
                       green: !lambda 'return id(led_ring_color_g);'
                       blue: !lambda 'return id(led_ring_color_b);'
+                      effect: "None"
                 else:
                   - light.turn_on:
                       id: status_ring
@@ -729,18 +778,21 @@ script:
             return;
           }
 
+          // One hue AND one motion per phase - speed alone is too subtle to
+          // read across a room. Blue = your turn, amber spin = working,
+          // green = talking back. Purple stays reserved for timers/alarms.
           switch (phase) {
             case ${voice_assist_waiting_for_command_phase_id}:
-              set("solid", 0.5, 0.0, 0.5);
+              set("solid", 0.0, 0.3, 1.0);            // awake, waiting for you
               return;
             case ${voice_assist_listening_for_command_phase_id}:
-              set("Pulse Medium", 0.8, 0.0, 0.8);
+              set("Pulse Fast", 0.0, 0.9, 0.9);       // hearing you speak
               return;
             case ${voice_assist_thinking_phase_id}:
-              set("Pulse Slow", 0.6, 0.0, 0.6);
+              set("Comet", 1.0, 0.35, 0.0);           // spinning = working
               return;
             case ${voice_assist_replying_phase_id}:
-              set("Wipe", 0.6, 0.0, 0.6);
+              set("Pulse Slow", 0.0, 1.0, 0.25);      // its turn to talk
               return;
             case ${voice_assist_error_phase_id}:
               set("Pulse Fast", 1.0, 0.0, 0.0);
@@ -1144,6 +1196,59 @@ sensor:
     icon: "mdi:timer"
     accuracy_decimals: 0
 
+  # Headroom instrumentation. Before adding anything heavy (bluetooth_proxy,
+  # another wake word model), take a baseline from these and compare after.
+  # "Heap max block" is the one that matters: BLE init fails on the largest
+  # contiguous block, not on total free heap, so `free` can look healthy while
+  # `block` has already fallen below what the stack needs.
+  - platform: debug
+    free:
+      name: "Heap free"
+      entity_category: diagnostic
+    block:
+      name: "Heap max block"
+      entity_category: diagnostic
+    min_free:
+      name: "Heap min free"
+      entity_category: diagnostic
+      disabled_by_default: true
+    psram:
+      name: "PSRAM free"
+      entity_category: diagnostic
+    loop_time:
+      name: "Loop time"
+      entity_category: diagnostic
+
+  # Reads the SoC die, which sits well above room temperature and climbs with
+  # radio load. Useful as a trend, not as a thermometer.
+  - platform: internal_temperature
+    name: "Internal temperature"
+    entity_category: diagnostic
+    disabled_by_default: true
+
+  - platform: wifi_signal
+    name: "WiFi signal"
+    entity_category: diagnostic
+    update_interval: 60s
+
+  # Rides on the capture micro_wake_word already runs - passive: true means it
+  # never starts the mic itself, so it costs a buffer and no extra I2S traffic.
+  # Values are relative dB, where 0 is the loudest the ES7210 can register.
+  # Muting the mic zeroes the ADC gain, so a muted device reads as silence.
+  - platform: sound_level
+    microphone:
+      microphone: i2s_mics
+      channels: $which_mic
+    passive: true
+    measurement_duration: 1000ms
+    rms:
+      name: "Ambient sound level"
+      id: ambient_sound_level
+    peak:
+      name: "Peak sound level"
+      id: peak_sound_level
+      disabled_by_default: true
+
 text_sensor:
   - platform: template
     id: next_timer_name
@@ -1158,6 +1263,14 @@ text_sensor:
     name: "Current device time"
     id: current_time
     icon: mdi:clock
+  - platform: debug
+    device:
+      name: "Device info"
+      entity_category: diagnostic
+      disabled_by_default: true
+    reset_reason:
+      name: "Reset reason"
+      entity_category: diagnostic
 
 button:
   - platform: factory_reset

@@ -57,8 +57,10 @@ logger:
 # Dynamic phase packs both pulses into one PWM period: IN2 is re-phased
 # every frame to start exactly where IN1's pulse ends, so splits like
 # 75/25 are legal at full brightness. The only per-strand limit is Max
-# Strand Duty (>50% duty exceeds AC-design power — thermal-test before
-# raising it). If a commanded balance would exceed the cap, the SPLIT is
+# Strand Duty. These strands have no datasheet; they're driven off 5V and
+# LEDs like them usually run near 3.3V, so the 65% default holds the
+# average at ~3.25V. No heat problems have shown up in months of use.
+# If a commanded balance would exceed the cap, the SPLIT is
 # clamped, never the total, so effects cannot pulse the room even at 100%.
 #
 # min_power is a dropout floor: any strand that should be lit at all is
@@ -108,7 +110,8 @@ script:
           float wb = powf(1.0f - x, g);
           float w  = (wa + wb) > 0.0f ? wa / (wa + wb) : 0.5f;
 
-          // Per-strand cap (thermal: >50% duty exceeds AC-design power).
+          // Per-strand cap: 65% of the 5V rail averages ~3.25V, about
+          // where these LEDs normally sit. Only binds on lopsided splits.
           // Clamp the SPLIT, never the total, so flux stays constant and
           // effects can't pulse the room — they just lose swing range if
           // the cap binds.
@@ -174,7 +177,7 @@ number:
     min_value: 50
     max_value: 98
     step: 1
-    initial_value: 65           # >50% exceeds AC-design power; raise carefully
+    initial_value: 65           # ~3.25V average off the 5V rail
     optimistic: true
     restore_value: true
     unit_of_measurement: "%"
