@@ -1,0 +1,302 @@
+# ---------------------------------------------------------------------------
+# Two-strand bidirectional fairy lights on a DRV-style H-bridge.
+#
+# This is a PACKAGE. Your device config supplies esphome:/wifi:/api:/ota:;
+# this file supplies the driver, the light entity, and the tuning numbers.
+#
+#   packages:
+#     fairy: github://traverseda/esphome_snippets/fairy-lights.yaml@main
+#
+# Override any substitution below by declaring it in your own config.
+#
+# Wifi note for this board: output_power: 15dB is what fixed connecting here.
+# 8.5dB is the minimum and tanks throughput/latency — walk down from 15dB
+# only if connection problems return.
+# ---------------------------------------------------------------------------
+
+substitutions:
+  light_name: "Fairy Lights"
+  # H-bridge inputs. IN1 drives the forward strand, IN2 the reverse strand.
+  a_in1_pin: GPIO6
+  a_in2_pin: GPIO7
+  b_in1_pin: GPIO8
+  b_in2_pin: GPIO9
+  # 80MHz/2^14: max C3 resolution (14-bit), 4x lower dropout floor vs 19531Hz
+  pwm_frequency: "4882Hz"
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf   # required for ledc phase_angle
+
+logger:
+
+# ---------------------------------------------------------------------------
+# Architecture
+#
+#   light (brightness, effects)      numbers (gamma, min_power)
+#              \                          /
+#               v                        v
+#            g_brightness   g_balance (0..255, effects write this)
+#                     \        |
+#                      v       v
+#                  apply_levels script   <- single place where duty is computed
+#                      /       \
+#                     v         v
+#              forward_out   reverse_out  ->  ledc channels
+#
+# Effects never touch brightness. They only move g_balance and re-run
+# apply_levels. Room illumination is the SUM OF FLUX from both strands,
+# and flux is linear in duty — so "no pulsing" means the total duty is a
+# function of the slider only:
+#
+#   T      = budget * slider^gamma     (total duty; gamma linearises slider)
+#   w      = x^g / (x^g + (1-x)^g)     (gamma-shaped split, symmetric feel)
+#   duty_f = T*w,  duty_r = T*(1-w)    (sum is always exactly T)
+#
+# Dynamic phase packs both pulses into one PWM period: IN2 is re-phased
+# every frame to start exactly where IN1's pulse ends, so splits like
+# 75/25 are legal at full brightness. The only per-strand limit is Max
+# Strand Duty (>50% duty exceeds AC-design power — thermal-test before
+# raising it). If a commanded balance would exceed the cap, the SPLIT is
+# clamped, never the total, so effects cannot pulse the room even at 100%.
+#
+# min_power is a dropout floor: any strand that should be lit at all is
+# kept at or above it. Its percent value is still calibrated against the
+# old half-period strand maximum, so previously measured values carry over.
+# ---------------------------------------------------------------------------
+
+globals:
+  - id: g_brightness           # perceptual master brightness, 0..1
+    type: float
+    initial_value: '0.0'
+  - id: g_balance              # 0 = all reverse strand, 255 = all forward strand
+    type: float
+    initial_value: '127.5'
+
+script:
+  - id: apply_levels
+    mode: single
+    then:
+      - lambda: |-
+          float p = id(g_brightness);                 // 0..1 slider
+          float x = id(g_balance) / 255.0f;           // 0..1 balance
+          float g = id(gamma_number).state;
+          float mp = id(min_power_number).state / 100.0f;
+
+          // Min Power stays calibrated as percent of the half-period (the
+          // old per-strand maximum), so restored values keep their meaning.
+          float fl = mp * 0.5f;
+
+          // Total duty budget < 100%: dead gap for non-atomic phase+duty
+          // updates, and keeps write_state off the ledc_stop DC fast-path.
+          const float BUDGET_RAW = 0.98f;
+          // Work pre-floor-remap: the remap below inflates duties, so
+          // shrink the budget and strand cap to compensate.
+          float budget = fmaxf((BUDGET_RAW - 2.0f * fl) / (1.0f - fl), 0.0f);
+          float m_pre  = fmaxf((id(max_duty_number).state / 100.0f - fl)
+                               / (1.0f - fl), 0.0f);
+
+          // Room illumination is total FLUX, which is linear in duty. So
+          // "no pulsing" = total duty depends only on the slider. Gamma
+          // here just makes the slider perceptually linear.
+          float T = budget * powf(p, g);
+
+          // Gamma-shaped split so the balance sweep feels symmetric and
+          // perceptually even (same shaping as the original config).
+          float wa = powf(x, g);
+          float wb = powf(1.0f - x, g);
+          float w  = (wa + wb) > 0.0f ? wa / (wa + wb) : 0.5f;
+
+          // Per-strand cap (thermal: >50% duty exceeds AC-design power).
+          // Clamp the SPLIT, never the total, so flux stays constant and
+          // effects can't pulse the room — they just lose swing range if
+          // the cap binds.
+          if (T > 0.0f) {
+            float w_hi = fmaxf(fminf(1.0f, m_pre / T), 0.5f);
+            w = esphome::clamp(w, 1.0f - w_hi, w_hi);
+          }
+
+          float duty_f = T * w;
+          float duty_r = T * (1.0f - w);
+
+          // dropout floor: remap (not clamp!) into [fl, 1] so any lit
+          // strand stays above the minimum PWM the LEDs respond to.
+          if (p > 0.0f) {
+            if (duty_f > 0.0f) duty_f = fl + duty_f * (1.0f - fl);
+            if (duty_r > 0.0f) duty_r = fl + duty_r * (1.0f - fl);
+          }
+
+          // Dynamic phase: strand B's pulse begins exactly where strand A's
+          // ends, packing both into one PWM period. This is what makes
+          // splits like 75/25 legal at full brightness. Must run before the
+          // level writes, since write_state re-derives hpoint from phase.
+          float split_deg = duty_f * 360.0f;
+          id(ain2).set_phase_angle(split_deg);
+          id(bin2).set_phase_angle(split_deg);
+
+          id(forward_out).set_level(duty_f);
+          id(reverse_out).set_level(duty_r);
+
+number:
+  - platform: template
+    name: "Gamma"
+    id: gamma_number
+    min_value: 1.0
+    max_value: 4.0
+    step: 0.05
+    initial_value: 2.2
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    icon: "mdi:chart-bell-curve"
+    on_value:
+      - script.execute: apply_levels
+
+  - platform: template
+    name: "Min Power"
+    id: min_power_number
+    min_value: 0
+    max_value: 15
+    step: 0.1
+    initial_value: 3.6          # ~0.22^2.2, the measured dropout point
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    entity_category: config
+    icon: "mdi:arrow-collapse-down"
+    on_value:
+      - script.execute: apply_levels
+
+  - platform: template
+    name: "Max Strand Duty"
+    id: max_duty_number
+    min_value: 50
+    max_value: 98
+    step: 1
+    initial_value: 65           # >50% exceeds AC-design power; raise carefully
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    entity_category: config
+    icon: "mdi:speedometer"
+    on_value:
+      - script.execute: apply_levels
+
+output:
+  # --- hardware: DRV-style H-bridge ----------------------------------------
+  # No max_power here: levels map 1:1 to duty. Pulse non-overlap is now
+  # guaranteed by apply_levels, which re-phases IN2 every frame so its pulse
+  # starts exactly where IN1's ends, and keeps duty_f + duty_r <= 98%.
+  # The phase_angle below is only a safe boot default.
+  - platform: ledc
+    pin: ${a_in1_pin}
+    id: ain1
+    channel: 0
+    frequency: ${pwm_frequency}
+  - platform: ledc
+    pin: ${a_in2_pin}
+    id: ain2
+    channel: 1
+    phase_angle: 180
+    frequency: ${pwm_frequency}
+  - platform: ledc
+    pin: ${b_in1_pin}
+    id: bin1
+    channel: 2
+    frequency: ${pwm_frequency}
+  - platform: ledc
+    pin: ${b_in2_pin}
+    id: bin2
+    channel: 3
+    phase_angle: 180
+    frequency: ${pwm_frequency}
+
+  # --- fan-out: one logical output per direction ---------------------------
+  - platform: template
+    id: forward_out
+    type: float
+    write_action:
+      - output.set_level:
+          id: ain1
+          level: !lambda return state;
+      - output.set_level:
+          id: bin1
+          level: !lambda return state;
+
+  - platform: template
+    id: reverse_out
+    type: float
+    write_action:
+      - output.set_level:
+          id: ain2
+          level: !lambda return state;
+      - output.set_level:
+          id: bin2
+          level: !lambda return state;
+
+  # --- the light writes brightness here; everything else derives from it ---
+  - platform: template
+    id: brightness_sink
+    type: float
+    write_action:
+      - lambda: id(g_brightness) = state;
+      - script.execute: apply_levels
+
+light:
+  - platform: monochromatic
+    name: ${light_name}
+    id: fairy
+    output: brightness_sink
+    gamma_correct: 1.0          # IMPORTANT: gamma is handled in apply_levels
+    on_state:
+      - lambda: |-
+          // re-center the strands whenever no effect is running
+          if (id(fairy).get_effect_name() == "None") {
+            id(g_balance) = 127.5f;
+            id(apply_levels).execute();
+          }
+    effects:
+      # Slow full sweep between strands on a sine, ~15 s per cycle.
+      - lambda:
+          name: "Crossfade"
+          update_interval: 20ms
+          lambda: |-
+            const float period_ms = 15000.0f;
+            float phase = (millis() % (uint32_t) period_ms) / period_ms
+                          * 2.0f * (float) M_PI;
+            id(g_balance) = 127.5f + 127.5f * sinf(phase);
+            id(apply_levels).execute();
+
+      # Organic random drift between strands, stays within the 89–166 band
+      # (0.35–0.65 in normalised space) so neither strand ever goes dark.
+      # The step is capped at the remaining distance to the target, so it
+      # arrives exactly and can never oscillate around it, regardless of
+      # how much the loop interval jitters.
+      - lambda:
+          name: "Fireflies"
+          update_interval: 20ms
+          lambda: |-
+            static float balance = 127.5f;
+            static float target  = 127.5f;
+            static float rate    = 80.0f;   // balance units per second
+            static uint32_t last_ms = millis();
+            uint32_t now = millis();
+            float dt = (now - last_ms) / 1000.0f;
+            last_ms = now;
+            // clamp dt so a stall/resume can't cause a huge jump
+            dt = fminf(dt, 0.1f);
+            float step = rate * dt;
+            float dist = target - balance;
+            if (fabsf(dist) <= step) {
+              // arrive exactly, then pick a new destination and speed
+              balance = target;
+              // 0.35–0.65 normalised == 89.25–165.75 in 0..255 space
+              target = 89.25f + random_float() * 76.5f;
+              // (0.02–0.08 norm/s) * 8, as in the bedroom config: ~41–163 units/s
+              rate   = (0.02f + random_float() * 0.06f) * 8.0f * 255.0f;
+            } else {
+              balance += (dist > 0.0f ? step : -step);
+            }
+            id(g_balance) = balance;
+            id(apply_levels).execute();
