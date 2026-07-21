@@ -633,10 +633,6 @@ micro_wake_word:
                                 wake_word: !lambda return wake_word;
 
 globals:
-  - id: mic_gain_saved
-    type: float
-    restore_value: yes
-    initial_value: '32.0'
   - id: mic_is_muted
     type: bool
     restore_value: yes
@@ -1062,9 +1058,12 @@ switch:
           id(adc_mic).set_mic_gain(0.0f);
       - script.execute: flash_ring
     turn_off_action:
+      # Unmute restores the gain the number entity holds. It used to restore a
+      # separate mic_gain_saved global that nothing ever wrote to, so unmuting
+      # always jumped to that global's initial 32 dB regardless of the setting.
       - lambda: |-
           id(mic_is_muted) = false;
-          id(adc_mic).set_mic_gain(id(mic_gain_saved));
+          id(adc_mic).set_mic_gain(id(mic_gain_db).state);
       - script.execute: flash_ring
 
   - platform: template
@@ -1125,18 +1124,28 @@ switch:
       - script.execute: control_leds
 
 number:
+  # These three use on_value, not set_action, and all need optimistic: true.
+  # set_action only runs from control(), i.e. when something actively sets the
+  # number - a value restored from flash was published to HA but never pushed
+  # back into the hardware, so after a reboot HA showed one gain and the chip
+  # ran another. on_value fires on every state publish, including the restore
+  # in setup(), and optimistic: true is what makes control() publish at all
+  # (without it the entity also never updated in HA when you moved the slider).
   - platform: template
     id: mic_gain_db
     name: "Mic Gain (ES7210 dB)"
     entity_category: config
+    optimistic: true
     min_value: 0
     max_value: 42
     step: 1
     restore_value: true
     initial_value: 24
-    set_action:
+    # Muted wins: set_mic_gain() called before the ES7210's own setup() is
+    # stored and applied by it, so a device that boots muted stays muted.
+    on_value:
       - lambda: |-
-          id(adc_mic).set_mic_gain(x);
+          id(adc_mic).set_mic_gain(id(mic_is_muted) ? 0.0f : x);
       - logger.log:
           format: "[MIC] Set ES7210 gain to %.0f dB"
           args: ["x"]
@@ -1144,12 +1153,13 @@ number:
     id: va_gain_factor
     name: "Gain Factor"
     entity_category: config
+    optimistic: true
     min_value: 1
     max_value: 64
     step: 1
     restore_value: true
     initial_value: 32
-    set_action:
+    on_value:
       - lambda: |-
           id(va_mic).set_gain_factor(x);
       - logger.log:
@@ -1159,12 +1169,13 @@ number:
     id: va_noise_suppression
     name: "Noise Suppression"
     entity_category: config
+    optimistic: true
     min_value: 0
     max_value: 4
     step: 1
     restore_value: true
     initial_value: 4
-    set_action:
+    on_value:
       - lambda: |-
           id(va).set_noise_suppression_level(x);
       - logger.log:
