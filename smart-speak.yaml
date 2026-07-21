@@ -55,10 +55,6 @@ esphome:
   on_boot:
     - priority: -100
       then:
-        - script.execute: apply_mic_gain
-        - lambda: |-
-            if (id(va_noise_suppression).has_state())
-              id(va).set_noise_suppression_level(id(va_noise_suppression).state);
         - if:
             condition:
               switch.is_on: diag_disable_mic
@@ -314,11 +310,6 @@ audio_adc:
     i2c_id: internal_i2c
     sample_rate: $i2s_sample_rate
     bits_per_sample: $i2s_bps_mic
-    # 37.5dB is the chip's ceiling. Analog PGA sits ahead of the ADC, so it
-    # buys real SNR in a way the digital gain_factor below cannot - max it out
-    # first, then make up the rest digitally. ESPHome's es7210 writes no
-    # digital-volume or ALC registers, so this is the whole analog story.
-    mic_gain: 37.5db
 
 external_components:
   - source:
@@ -454,7 +445,6 @@ voice_assistant:
     id: va_mic
     microphone: i2s_mics
     channels: $which_mic
-    gain_factor: 16
   media_player: external_media_player
   micro_wake_word: mww
   use_wake_word: false
@@ -592,15 +582,9 @@ voice_assistant:
 
 micro_wake_word:
   id: mww
-  # gain_factor defaults to 1 and each MicrophoneSource carries its own, so
-  # without this line wake-word detection runs on raw ADC output while the
-  # voice assistant gets an amplified copy - the wake word is deaf at any
-  # distance no matter what the sliders say. Keep it equal to va_mic's.
   microphone:
-    id: mww_mic
     microphone: i2s_mics
     channels: $which_mic
-    gain_factor: 16
   stop_after_detection: false
   models:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
@@ -649,6 +633,10 @@ micro_wake_word:
                                 wake_word: !lambda return wake_word;
 
 globals:
+  - id: mic_gain_saved
+    type: float
+    restore_value: yes
+    initial_value: '32.0'
   - id: mic_is_muted
     type: bool
     restore_value: yes
@@ -701,22 +689,6 @@ globals:
     initial_value: 'false'
 
 script:
-  # The one place that pushes gain at the hardware. Template numbers never fire
-  # their set_action at boot - setup() publishes the restored value and returns -
-  # so without calling this on_boot the sliders would show a value the chip
-  # isn't running. Unmute routes through here too, so it can't stomp the number.
-  - id: apply_mic_gain
-    mode: single
-    then:
-      - lambda: |-
-          if (id(mic_is_muted)) return;
-          const float db = id(mic_gain_db).has_state() ? id(mic_gain_db).state : 37.5f;
-          const int32_t gf = id(va_gain_factor).has_state() ? (int32_t) id(va_gain_factor).state : 16;
-          id(adc_mic).set_mic_gain(db);
-          id(va_mic).set_gain_factor(gf);
-          id(mww_mic).set_gain_factor(gf);
-          ESP_LOGI("mic", "apply_mic_gain: pga=%.1fdB digital=%dx", db, (int) gf);
-
   - id: flash_ring
     then:
       - light.turn_on: { id: status_ring, red: 1.0, green: 0.0, blue: 0.0, brightness: 100% }
@@ -1084,21 +1056,15 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     lambda: |-
       return id(mic_is_muted);
-    # 0dB PGA is attenuation-to-unity, not a real mute, and the digital gain
-    # sits downstream of it - leaving gain_factor at 16 would let a "muted"
-    # device still pass audible speech. Drop both. A hard mute needs
-    # microphone.stop_capture; this matches the previous behaviour's intent.
     turn_on_action:
       - lambda: |-
           id(mic_is_muted) = true;
           id(adc_mic).set_mic_gain(0.0f);
-          id(va_mic).set_gain_factor(1);
-          id(mww_mic).set_gain_factor(1);
       - script.execute: flash_ring
     turn_off_action:
       - lambda: |-
           id(mic_is_muted) = false;
-      - script.execute: apply_mic_gain
+          id(adc_mic).set_mic_gain(id(mic_gain_saved));
       - script.execute: flash_ring
 
   - platform: template
@@ -1159,44 +1125,40 @@ switch:
       - script.execute: control_leds
 
 number:
-  # optimistic: true is load-bearing on all three. TemplateNumber::control()
-  # only publishes state when optimistic is set - without it the set_action
-  # runs but the entity never reports the new value, so HA snaps the slider
-  # back and the control looks broken.
   - platform: template
     id: mic_gain_db
     name: "Mic Gain (ES7210 dB)"
     entity_category: config
-    optimistic: true
-    # The chip quantises to 0/3/6...33, then 34.5/36/37.5 - 1.5 steps reach
-    # every real setting. The old max of 42 was above the 37.5 ceiling, so the
-    # top four positions silently clamped to the same value.
     min_value: 0
-    max_value: 37.5
-    step: 1.5
+    max_value: 42
+    step: 1
     restore_value: true
-    initial_value: 37.5
+    initial_value: 24
     set_action:
-      - script.execute: apply_mic_gain
+      - lambda: |-
+          id(adc_mic).set_mic_gain(x);
+      - logger.log:
+          format: "[MIC] Set ES7210 gain to %.0f dB"
+          args: ["x"]
   - platform: template
     id: va_gain_factor
     name: "Gain Factor"
     entity_category: config
-    optimistic: true
-    # Digital multiply in Q25, clamped - so overshooting clips rather than
-    # wrapping. 16x is +24dB on top of the 37.5dB PGA.
     min_value: 1
     max_value: 64
     step: 1
     restore_value: true
-    initial_value: 16
+    initial_value: 32
     set_action:
-      - script.execute: apply_mic_gain
+      - lambda: |-
+          id(va_mic).set_gain_factor(x);
+      - logger.log:
+          format: "[MIC] Set gain factor to %.0f"
+          args: ["x"]
   - platform: template
     id: va_noise_suppression
     name: "Noise Suppression"
     entity_category: config
-    optimistic: true
     min_value: 0
     max_value: 4
     step: 1
