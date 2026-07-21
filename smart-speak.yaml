@@ -1138,7 +1138,22 @@ switch:
       - script.execute: control_leds
 
 number:
-  # These three use on_value, not set_action, and all need optimistic: true.
+  # Gain staging: take the level in the analog domain, not the digital one.
+  # mic_gain_db is the ES7210's PGA, ahead of the ADC, so it lifts the signal
+  # above the converter's noise floor - real SNR. gain_factor is a plain integer
+  # multiply applied to samples afterwards, which scales the noise up with the
+  # signal and hard-clips on overflow, so it buys nothing the PGA can't do
+  # better. Hence a high mic_gain_db and a low gain_factor.
+  #
+  # micro_wake_word's microphone source deliberately has no gain_factor at all
+  # (default 1): with the PGA set correctly it does not need one, and mWW is the
+  # consumer that suffers most from clipped audio.
+  #
+  # These are initial_value only - restore_value means a device that has already
+  # stored a value keeps it, so changing these does nothing to a flashed device
+  # until you set them in HA or factory reset.
+  #
+  # These use on_value, not set_action, and both need optimistic: true.
   # set_action only runs from control(), i.e. when something actively sets the
   # number - a value restored from flash was published to HA but never pushed
   # back into the hardware, so after a reboot HA showed one gain and the chip
@@ -1154,7 +1169,7 @@ number:
     max_value: 42
     step: 1
     restore_value: true
-    initial_value: 24
+    initial_value: 30
     # Muted wins: set_mic_gain() called before the ES7210's own setup() is
     # stored and applied by it, so a device that boots muted stays muted.
     on_value:
@@ -1172,29 +1187,21 @@ number:
     max_value: 64
     step: 1
     restore_value: true
-    initial_value: 32
+    initial_value: 4
     on_value:
       - lambda: |-
           id(va_mic).set_gain_factor(x);
       - logger.log:
           format: "[MIC] Set gain factor to %.0f"
           args: ["x"]
-  - platform: template
-    id: va_noise_suppression
-    name: "Noise Suppression"
-    entity_category: config
-    optimistic: true
-    min_value: 0
-    max_value: 4
-    step: 1
-    restore_value: true
-    initial_value: 4
-    on_value:
-      - lambda: |-
-          id(va).set_noise_suppression_level(x);
-      - logger.log:
-          format: "[MIC] Set suppression to %.0f"
-          args: ["x"]
+  # REMOVED: a "Noise Suppression" number driving va.set_noise_suppression_level().
+  # That value is only packed into the audio_settings protobuf and sent to HA;
+  # it has no device-side effect, and HA's esphome integration now takes
+  # audio_settings in handle_pipeline_start() and never reads it again. It never
+  # touched the wake word in any case - micro_wake_word runs entirely on-device,
+  # upstream of anything the server does. Same story for auto_gain and
+  # volume_multiplier in the voice_assistant block, which are left at their
+  # defaults rather than exposed as controls that do nothing.
   - platform: template
     id: led_ring_brightness
     name: "LED Ring Brightness"
@@ -1271,6 +1278,25 @@ sensor:
   # prime suspect for wake-word detection getting worse. Do not re-add it
   # without A/B-ing detection rate; use "Ambient sound level" from a separate
   # device if you want room-noise telemetry.
+  #
+  # Kept commented out as a gain-tuning tool. Uncomment, flash, set mic_gain_db
+  # so that "Peak sound level" reads about -6 to -3 dB while you talk at the
+  # device from where you normally stand - that is the ADC's full scale, so 0 dB
+  # is already clipping - then comment it out again and reflash. Leaving it in
+  # while judging wake-word performance defeats the point of the A/B.
+  #
+  # - platform: sound_level
+  #   microphone:
+  #     microphone: i2s_mics
+  #     channels: $which_mic
+  #   passive: true
+  #   measurement_duration: 1000ms
+  #   rms:
+  #     name: "Ambient sound level"
+  #     id: ambient_sound_level
+  #   peak:
+  #     name: "Peak sound level"
+  #     id: peak_sound_level
 
 text_sensor:
   - platform: template
