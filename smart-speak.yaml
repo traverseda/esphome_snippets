@@ -802,25 +802,27 @@ script:
             return;
           }
           if (ringing) {
-            set("Pulse Fast", 0.6, 0.0, 0.6);
+            set("Pulse Fast", 0.0, 1.0, 0.2);
             return;
           }
 
-          // One hue AND one motion per phase - speed alone is too subtle to
-          // read across a room. Blue = your turn, amber spin = working,
-          // green = talking back. Purple stays reserved for timers/alarms.
+          // Violet = the turn is yours, blue = the device is talking back.
+          // Motion carries the phase within violet, since speed alone is too
+          // subtle to read across a room: steady means it is waiting on you,
+          // fast pulse means it hears you, rotation means it is working.
+          // Timers and alarms own green, on the same steady/fast split.
           switch (phase) {
             case ${voice_assist_waiting_for_command_phase_id}:
-              set("solid", 0.0, 0.3, 1.0);            // awake, waiting for you
+              set("solid", 0.55, 0.0, 1.0);           // awake, waiting for you
               return;
             case ${voice_assist_listening_for_command_phase_id}:
-              set("Pulse Fast", 0.0, 0.9, 0.9);       // hearing you speak
+              set("Pulse Fast", 0.8, 0.2, 1.0);       // hearing you speak
               return;
             case ${voice_assist_thinking_phase_id}:
-              set("Comet", 1.0, 0.35, 0.0);           // spinning = working
+              set("Comet", 0.55, 0.0, 1.0);           // spinning = working
               return;
             case ${voice_assist_replying_phase_id}:
-              set("Pulse Slow", 0.0, 1.0, 0.25);      // its turn to talk
+              set("Pulse Slow", 0.0, 0.35, 1.0);      // its turn to talk
               return;
             case ${voice_assist_error_phase_id}:
               set("Pulse Fast", 1.0, 0.0, 0.0);
@@ -832,7 +834,7 @@ script:
           }
 
           if (timers_active) {
-            set("Pulse Slow", 0.6, 0.0, 0.6);
+            set("Pulse Slow", 0.0, 1.0, 0.2);
             return;
           }
 
@@ -841,15 +843,19 @@ script:
   - id: control_leds_volume_changed
     mode: restart
     then:
+      # White, not green: green now means timers, and this flash is Pulse Fast
+      # like a ringing timer is. Flashing green here would have been invisible
+      # feedback in exactly the case you most want it - hitting volume while an
+      # alarm is going off. White belongs to no phase, so it always reads.
       - light.turn_on:
           id: status_ring
           brightness: !lambda 'return id(led_ring_brightness).state;'
-          red: 0.0
+          red: 1.0
           green: 1.0
-          blue: 0.0
+          blue: 1.0
           effect: "Pulse Fast"
       - lambda: |-
-          ESP_LOGD("led", "volume_changed: flash green");
+          ESP_LOGD("led", "volume_changed: flash white");
       - delay: 1.2s
       - script.execute: control_leds
 
