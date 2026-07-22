@@ -50,6 +50,12 @@ substitutions:
 
   led_num: '7' # WS2812 ring leds
 
+  # How long an announcement may sit in ANNOUNCING without a single decoded
+  # sample before the watchdog gives up on it. Keep this above 30s: a slow
+  # header fetch is retried six times at 5s each before the reader errors, and
+  # audio that does eventually arrive should never be cut off.
+  stalled_announcement_ms: '35000'
+
 esphome:
   min_version: 2025.8.0
   on_boot:
@@ -684,6 +690,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  - id: stalled_announcement_for_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
 
 script:
   - id: flash_ring
@@ -981,6 +991,34 @@ script:
           data:
             text: !lambda return stt_text;
 
+  # A failed announcement URL is retried forever by the speaker media player:
+  # the playlist item is only popped once a file has played, so a read error
+  # restarts the same dead URL ~20x/second until something stops it. Drop the
+  # announcement ourselves so the ring, the log and HA all recover.
+  - id: abort_stalled_announcement
+    mode: single
+    then:
+      - logger.log:
+          level: ERROR
+          format: "Announcement produced no audio for %dms, dropping it"
+          args: ['${stalled_announcement_ms}']
+      - lambda: |-
+          id(external_media_player)
+            ->make_call()
+            .set_command(media_player::MediaPlayerCommand::MEDIA_PLAYER_COMMAND_STOP)
+            .set_announcement(true)
+            .perform();
+      - lambda: id(voice_assistant_phase) = ${voice_assist_error_phase_id};
+      - script.execute: control_leds
+      - delay: 2s
+      - wait_until:
+          condition:
+            not:
+              voice_assistant.is_running:
+          timeout: 10s
+      - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+      - script.execute: control_leds
+
   - id: publish_current_time
     mode: single
     then:
@@ -991,6 +1029,26 @@ script:
           if (current_time_string != last_time_string) {
             id(current_time).publish_state(current_time_string);
             last_time_string = current_time_string;
+          }
+
+interval:
+  # Nothing is decoded while the reader is failing, so the announcement speaker
+  # never starts - that, and not the media player state, is what tells a stuck
+  # announcement apart from one that is simply still playing.
+  - interval: 1s
+    then:
+      - lambda: |-
+          const bool announcing =
+              id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
+          if (!announcing || id(announcement_resampling_speaker)->is_running() ||
+              id(timer_ringing).state) {
+            id(stalled_announcement_for_ms) = 0;
+            return;
+          }
+          id(stalled_announcement_for_ms) += 1000;
+          if (id(stalled_announcement_for_ms) >= ${stalled_announcement_ms}) {
+            id(stalled_announcement_for_ms) = 0;
+            id(abort_stalled_announcement).execute();
           }
 
 select:
