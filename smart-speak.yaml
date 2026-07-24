@@ -15,6 +15,12 @@
 # merge into it rather than replacing it.
 # ---------------------------------------------------------------------------
 
+packages:
+  # Passive BLE beacon forwarding. Beacons only - no connection slots, which is
+  # what keeps it affordable next to the audio pipeline and the wake word
+  # model. See that file for the scan-rate substitutions it exposes.
+  ble: github://traverseda/esphome_snippets/ble-beacon-proxy.yaml@main
+
 substitutions:
   # Phases of the Voice Assistant
   voice_assist_idle_phase_id: '1' # ready to be triggered by a wake word

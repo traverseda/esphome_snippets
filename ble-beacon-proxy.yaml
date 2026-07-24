@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------------
+# Passive BLE beacon proxy for Home Assistant.
+#
+# This is a PACKAGE, and it is already pulled in by smart-speak.yaml and
+# fairy-lights.yaml - you do not need to include it yourself unless you want it
+# on some other device:
+#
+#   packages:
+#     ble: github://traverseda/esphome_snippets/ble-beacon-proxy.yaml@main
+#
+# Beacons only. The device forwards BLE advertisements to HA and nothing else:
+# HA cannot reach through it to connect to a device, so anything needing a
+# connection (most locks, some thermostats, reading a Bluetooth device's
+# battery over GATT) still needs a full proxy elsewhere. That is the whole
+# point - connection slots are the expensive part of bluetooth_proxy, and this
+# config carries none of them.
+#
+# Requires an ESP32; there is no BLE on the ESP8266. Both current consumers are
+# esp-idf, which is what the BLE stack wants anyway.
+# ---------------------------------------------------------------------------
+
+substitutions:
+  # Passive scanning by default: the device listens for advertisements but
+  # never sends SCAN_REQ to solicit a scan response. Beacons - BTHome, iBeacon,
+  # ATC/pvvx-flashed Xiaomi thermometers, Govee - put their payload in the
+  # advertisement itself, so passive sees all of it.
+  #
+  # This matters more than usual here. ESP32 BLE and wifi share one radio, and
+  # both devices using this package have a real-time job on the wifi side
+  # (streaming audio, or taking light commands without visible lag). Active
+  # scanning adds a transmit for every advertisement heard, in a busy room.
+  #
+  # Set ble_scan_active: "true" in your device config if a sensor only puts its
+  # data in the scan response - stock-firmware Xiaomi sensors are the usual
+  # example. Symptom is a device HA can see but whose values never populate.
+  ble_scan_active: "false"
+
+  # ESPHome's defaults. Window/interval is the duty cycle: the radio listens
+  # for `window` out of every `interval`, so 320/300 is ~94% of the time on
+  # BLE. Lower the window if wifi throughput suffers - that trades away
+  # advertisements you would otherwise have caught.
+  ble_scan_interval: 320ms
+  ble_scan_window: 300ms
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: ${ble_scan_active}
+    interval: ${ble_scan_interval}
+    window: ${ble_scan_window}
+
+bluetooth_proxy:
+  # active: false is what makes this a beacon proxy rather than a full one. It
+  # stops HA opening connections through this device, which is what would
+  # otherwise reserve per-connection buffers out of the same heap the audio
+  # pipeline and wake word models are competing for.
+  #
+  # `esphome config` still prints connection_slots: 3 here - ignore it. That is
+  # the schema default, and the component only consumes slots and instantiates
+  # BluetoothConnection objects when active is true, so the build gets
+  # BLUETOOTH_PROXY_MAX_CONNECTIONS 0.
+  active: false
