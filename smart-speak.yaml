@@ -656,6 +656,14 @@ globals:
     type: float
     restore_value: yes
     initial_value: '1.0'
+  # The brightness the ring is currently showing - the user's configured
+  # brightness for every state except mute, which sits below that slider's
+  # 0.4 minimum. Kept alongside the colour so the led_ring_brightness slider's
+  # on_value can re-apply whatever is live without knowing the state.
+  - id: led_ring_brightness_active
+    type: float
+    restore_value: no
+    initial_value: '0.8'
   - id: init_in_progress
     type: bool
     restore_value: no
@@ -696,12 +704,34 @@ globals:
     initial_value: '0'
 
 script:
+  # Mute and unmute both flash this, in the colour of the state being entered:
+  # red going quiet, purple coming back. A red unmute flash would have been the
+  # wrong signal now that a resting red ring is what muted looks like.
+  #
+  # It used to end by turning the ring off, which stranded it dark until
+  # whatever next called control_leds - now it hands back, so the flash settles
+  # onto the mute indicator (or onto a pending timer, which the old turn_off
+  # also used to blank).
   - id: flash_ring
+    mode: restart
+    parameters:
+      r: float
+      g: float
+      b: float
     then:
-      - light.turn_on: { id: status_ring, red: 1.0, green: 0.0, blue: 0.0, brightness: 100% }
+      - light.turn_on:
+          id: status_ring
+          brightness: 100%
+          red: !lambda 'return r;'
+          green: !lambda 'return g;'
+          blue: !lambda 'return b;'
+          effect: "None"
       - delay: 250ms
-      - light.turn_off: status_ring
+      - script.execute: control_leds
 
+  # brightness is passed in rather than read from led_ring_brightness, because
+  # the mute indicator sits below that number's 0.4 minimum. Callers that want
+  # the user's configured brightness pass it explicitly.
   - id: led_set_effect
     mode: restart
     parameters:
@@ -709,13 +739,15 @@ script:
       r: float
       g: float
       b: float
+      brightness: float
     then:
       - lambda: |-
           id(led_ring_color_r) = r;
           id(led_ring_color_g) = g;
           id(led_ring_color_b) = b;
+          id(led_ring_brightness_active) = brightness;
           ESP_LOGI("led", "led_set_effect: effect='%s' rgb(%.2f, %.2f, %.2f) brightness=%.2f",
-                   effect.c_str(), r, g, b, (float) id(led_ring_brightness).state);
+                   effect.c_str(), r, g, b, brightness);
       - if:
           condition:
             lambda: 'return effect == "off";'
@@ -730,7 +762,7 @@ script:
                   # without it leaves the old effect animating in a new colour.
                   - light.turn_on:
                       id: status_ring
-                      brightness: !lambda 'return id(led_ring_brightness).state;'
+                      brightness: !lambda 'return id(led_ring_brightness_active);'
                       red: !lambda 'return id(led_ring_color_r);'
                       green: !lambda 'return id(led_ring_color_g);'
                       blue: !lambda 'return id(led_ring_color_b);'
@@ -738,7 +770,7 @@ script:
                 else:
                   - light.turn_on:
                       id: status_ring
-                      brightness: !lambda 'return id(led_ring_brightness).state;'
+                      brightness: !lambda 'return id(led_ring_brightness_active);'
                       red: !lambda 'return id(led_ring_color_r);'
                       green: !lambda 'return id(led_ring_color_g);'
                       blue: !lambda 'return id(led_ring_color_b);'
@@ -753,18 +785,22 @@ script:
           const bool ringing        = id(timer_ringing).state;
           const bool improv_ble     = id(improv_ble_in_progress);
           const bool init_progress  = id(init_in_progress);
+          const bool muted          = id(mic_is_muted);
           const int  phase          = id(voice_assistant_phase);
 
           id(check_if_timers_active).execute();
           const bool timers_active = id(is_timer_active);
 
           ESP_LOGD("led",
-                   "control_leds: wifi=%d api=%d improv=%d init=%d ringing=%d timers_active=%d phase=%d",
+                   "control_leds: wifi=%d api=%d improv=%d init=%d ringing=%d timers_active=%d muted=%d phase=%d",
                    (int)wifi_connected, (int)api_connected, (int)improv_ble, (int)init_progress,
-                   (int)ringing, (int)timers_active, phase);
+                   (int)ringing, (int)timers_active, (int)muted, phase);
 
           auto set = [&](const char* effect, float r, float g, float b) {
-            id(led_set_effect).execute(effect, r, g, b);
+            id(led_set_effect).execute(effect, r, g, b, id(led_ring_brightness).state);
+          };
+          auto set_dim = [&](const char* effect, float r, float g, float b, float brightness) {
+            id(led_set_effect).execute(effect, r, g, b, brightness);
           };
 
           if (improv_ble) {
@@ -814,6 +850,16 @@ script:
               set("Pulse Slow", 1.0, 0.0, 0.0);
               return;
             default: break;
+          }
+
+          // Muted outranks a pending timer. Both are resting states, but this
+          // is the one where the device will not answer you at all - a green
+          // pulse hiding that leaves you saying the wake word at a dead mic
+          // with nothing on the ring to explain it. It stays below ringing and
+          // below every voice phase, which are all momentary.
+          if (muted) {
+            set_dim("solid", 1.0, 0.0, 0.0, 0.12);
+            return;
           }
 
           if (timers_active) {
@@ -1128,7 +1174,11 @@ switch:
       - lambda: |-
           id(mic_is_muted) = true;
           id(adc_mic).set_mic_gain(0.0f);
-      - script.execute: flash_ring
+      - script.execute:
+          id: flash_ring
+          r: 1.0
+          g: 0.0
+          b: 0.0
     turn_off_action:
       # Unmute restores the gain the number entity holds. It used to restore a
       # separate mic_gain_saved global that nothing ever wrote to, so unmuting
@@ -1136,7 +1186,12 @@ switch:
       - lambda: |-
           id(mic_is_muted) = false;
           id(adc_mic).set_mic_gain(id(mic_gain_db).state);
-      - script.execute: flash_ring
+      # The measured purple the voice phases use - the ring is listening again.
+      - script.execute:
+          id: flash_ring
+          r: 1.0
+          g: 0.11
+          b: 0.945
 
   - platform: template
     id: mute_sound
@@ -1272,14 +1327,16 @@ number:
     step: 0.05
     initial_value: 0.8
     mode: slider
+    # Re-run the state machine rather than pushing the new brightness at the
+    # light directly: mute deliberately ignores this slider and sits at 12%, and
+    # a direct turn_on here would drag it up to the 0.4 minimum until something
+    # else refreshed the ring.
     on_value:
       - if:
           condition:
             light.is_on: status_ring
           then:
-            - light.turn_on:
-                id: status_ring
-                brightness: !lambda 'return x;'
+            - script.execute: control_leds
 
 sensor:
   - platform: template
