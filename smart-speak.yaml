@@ -597,6 +597,18 @@ voice_assistant:
   on_listening:
     - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
     - script.execute: control_leds
+  # These two fire from Home Assistant, not from this device. End-of-speech is
+  # decided by assist_pipeline's VoiceCommandSegmenter, which ends a command
+  # after silence_seconds (0.7 by default) of continuous non-speech and
+  # otherwise gives up at timeout_seconds (15).
+  #
+  # That is why a talking TV makes commands hang until they time out: its
+  # dialogue rarely leaves a 0.7 s gap. Nothing in this file can fix that, and
+  # several plausible-looking fixes have already been ruled out on this
+  # hardware - AEC, dual-mic BSS, wake-word channel locking, DoA, null-steering.
+  # Before trying any of them again, read "Known limitation: a TV in the room"
+  # in the README. The only exposed control is HA's "Finished speaking
+  # detection" select on the device entity.
   on_stt_vad_start:
     - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
     - script.execute: control_leds
@@ -763,6 +775,13 @@ globals:
     type: float
     restore_value: no
     initial_value: '0.8'
+  # Which TDM slot the audio stack is currently using as the AEC reference, so
+  # debug_ref_slot can skip the bus restart when the value has not actually
+  # changed. Must match tdm_ref_slot in the esp_audio_stack block.
+  - id: active_ref_slot
+    type: int
+    restore_value: no
+    initial_value: '1'
   - id: init_in_progress
     type: bool
     restore_value: no
@@ -1251,6 +1270,19 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF # default OFF = mic works as usual
 
+  # Debug mode. The slot level sensors poll at 500ms, so four of them plus the
+  # two AFE meters is twelve states a second into the recorder - fine while
+  # bringing the audio path up, pure noise afterwards. This gates their
+  # publishing rather than their existence, so they can be switched on from HA
+  # when something needs diagnosing and cost nothing the rest of the time.
+  - platform: template
+    id: debug_audio
+    name: "Debug: audio diagnostics"
+    icon: mdi:bug-check
+    optimistic: true
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+
   # A runtime A/B for the front end. Turning AEC off is the fastest way to tell
   # "the wake word got worse because the canceller is misconfigured" apart from
   # "the wake word got worse for some other reason" - flip it while music plays
@@ -1410,6 +1442,69 @@ number:
       - logger.log:
           format: "[MIC] Set post-AEC digital trim to %.0f dB"
           args: ["x"]
+  # Live reference-slot switch, for finding the AEC reference without a reflash.
+  #
+  # Which TDM slot carries the playback reference is not something the schematic
+  # answers: the ES7210 lays its channels across the frame as MIC1, MIC3, MIC2,
+  # MIC4, so the reference sits in slot 1 even though it is wired to channel 3.
+  # Getting that wrong is silent - AEC subtracts a microphone from a microphone
+  # and simply does nothing, with no error anywhere.
+  #
+  # CHANGING THIS STOPS PLAYBACK. Switching the reference slot has to tear the
+  # I2S bus down and bring it back, and whatever the media player was streaming
+  # does not survive that - the hardware recovers, the audio does not resume.
+  # So the measurement loop is: set the slot, THEN start playing, then read.
+  # Comparing slots means restarting playback each time, and any reading taken
+  # without audio actually playing is meaningless - with the room quiet, input
+  # and output both sit near the noise floor and their difference is noise.
+  #
+  # Workflow: turn on "Debug: audio diagnostics", set this slot, start music,
+  # then watch "Diag: AFE output RMS" against "Diag: AFE input volume". The
+  # correct slot is the one where output drops ~20 dB below input while audio is
+  # definitely playing. Check the input level looks like playback (about -33
+  # dBFS here) and not idle (about -53) before believing any of it.
+  #
+  # set_action, not on_value: this must fire only when somebody actually moves
+  # it, never from a restore or the initial publish, or the device would tear
+  # the audio path down mid-boot. It is deliberately not restored across
+  # reboots either - a stored wrong value would silently disable AEC on every
+  # boot, which is exactly the failure this control exists to diagnose.
+  - platform: template
+    id: debug_ref_slot
+    name: "Debug: AEC reference slot"
+    icon: mdi:swap-horizontal
+    entity_category: config
+    min_value: 0
+    max_value: 3
+    step: 1
+    restore_value: false
+    initial_value: 1
+    set_action:
+      - lambda: id(debug_ref_slot).publish_state(x);
+      # Writing the value it already holds must not tear anything down. HA and
+      # scripts both re-send the current value freely, and an unguarded restart
+      # here kills playback for no reason - which is exactly how the first
+      # attempt at measuring this destroyed its own test conditions.
+      - if:
+          condition:
+            lambda: return ((int) x) != id(active_ref_slot);
+          then:
+            # Release the mic before tearing the bus down - consumers are
+            # reference-counted, so stop_and_wait will not stop a stack that
+            # mWW is still holding.
+            - micro_wake_word.stop:
+            - delay: 150ms
+            - lambda: |-
+                const uint8_t slot = (uint8_t) id(debug_ref_slot).state;
+                id(audio_stack).stop_and_wait();
+                id(audio_stack).set_tdm_ref_slot(slot);
+                id(audio_stack).start();
+                id(active_ref_slot) = (int) slot;
+                ESP_LOGW("aec", "[DEBUG] reference slot now %u - playback was stopped by the "
+                                "bus restart, start audio again before reading AFE levels", slot);
+            - delay: 250ms
+            - micro_wake_word.start:
+
   - platform: template
     id: va_gain_factor
     name: "Gain Factor"
@@ -1544,30 +1639,45 @@ sensor:
   #
   # Remove these once the mapping is confirmed; they are four more states a
   # minute into the recorder for no ongoing benefit.
+  # All six are gated on the debug_audio switch: the lambda returning an empty
+  # optional drops the reading, so nothing publishes while debug is off.
   - platform: esp_audio_stack
     esp_audio_stack_id: audio_stack
     tdm_slot_levels:
       - slot: 0
         name: "Diag: TDM slot 0 (MIC1)"
         entity_category: diagnostic
+        filters: &debug_gated
+          - lambda: |-
+              if (!id(debug_audio).state) return {};
+              return x;
       - slot: 1
         name: "Diag: TDM slot 1 (MIC3 = AEC ref)"
         entity_category: diagnostic
+        filters: *debug_gated
       - slot: 2
         name: "Diag: TDM slot 2 (MIC2)"
         entity_category: diagnostic
+        filters: *debug_gated
       - slot: 3
         name: "Diag: TDM slot 3 (MIC4, unpopulated)"
         entity_category: diagnostic
+        filters: *debug_gated
 
   - platform: esp_afe
     esp_afe_id: afe_processor
+    # The pair that tells you whether AEC is doing anything: with the speaker
+    # playing, output_rms should sit well below input_volume. About 20 dB below
+    # on this board when the reference slot is right; within a couple of dB
+    # means the canceller is subtracting the wrong channel.
     input_volume:
       name: "Diag: AFE input volume"
       entity_category: diagnostic
+      filters: *debug_gated
     output_rms:
       name: "Diag: AFE output RMS"
       entity_category: diagnostic
+      filters: *debug_gated
 
 text_sensor:
   - platform: template
