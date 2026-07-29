@@ -13,13 +13,24 @@
 #   api:   id: api_id       (same)
 # The api: block here also defines actions and client-connect handlers, so
 # merge into it rather than replacing it.
+#
+# Requires ESPHome 2026.7.0+ and the esp-idf framework. The audio path is built
+# on the esphome-audio-stack external component rather than ESPHome's own
+# i2s_audio, so that AEC can run against the board's hardware echo reference -
+# see the audio section below. That component is young; pin this package to a
+# tag rather than tracking main if you care about reproducible builds.
 # ---------------------------------------------------------------------------
 
-packages:
-  # Passive BLE beacon forwarding. Beacons only - no connection slots, which is
-  # what keeps it affordable next to the audio pipeline and the wake word
-  # model. See that file for the scan-rate substitutions it exposes.
-  ble: github://traverseda/esphome_snippets/ble-beacon-proxy.yaml@main
+# The BLE beacon proxy used to be pulled in here. It cannot coexist with the
+# AEC front end on this chip - not for want of PSRAM, but because the I2S TDM
+# DMA descriptors are the last thing allocated and can only live in internal
+# DMA-capable memory. Bluedroid takes about 134 KB of internal RAM, which left
+# 21 KB free and a 13 KB largest block against the ~41 KB of TX+RX descriptors
+# the 4-slot TDM frame needs; I2S init failed with ESP_ERR_NO_MEM and both
+# audio directions latched into an error state.
+#
+# Beacons therefore need to come from a device that is not also doing voice.
+# ble-beacon-proxy.yaml is unchanged and still works on its own.
 
 substitutions:
   # Phases of the Voice Assistant
@@ -40,19 +51,9 @@ substitutions:
   i2c_sda: GPIO11
   rtc_int: 5 #ExtendedIO
 
-  #mic lookup
-  mic_channel_0: 'left'
-  mic_channel_1: 'right' # mic wont allow right
-  mic_channel_2: 'stereo' # voice assistant does not support stereo
-
-  which_mic: 0 #0=left, 1=right, 2=stereo
-  i2s_sample_rate: 16000 # must be 16000 for voice_assistant to work
-  i2s_mode_mic: secondary
-  i2s_mode_speaker: secondary
-  i2s_use_apll: true
-  i2s_bps_spk: 16bit
-  i2s_bps_mic: 16bit
-  i2s_mclk_multiple: 256 # 128, 256, 384, 512
+  # The mic-channel lookup, the per-bus i2s_mode/bps/apll/mclk knobs and
+  # which_mic are all gone: esp_audio_stack owns the bus and the codecs now, and
+  # takes its rates and slot layout from its own block below.
 
   led_num: '7' # WS2812 ring leds
 
@@ -63,7 +64,8 @@ substitutions:
   stalled_announcement_ms: '35000'
 
 esphome:
-  min_version: 2025.8.0
+  # esp_audio_stack is released against the 2026.7 component API.
+  min_version: 2026.7.0
   on_boot:
     - priority: -100
       then:
@@ -76,7 +78,7 @@ esphome:
               - logger.log: "Mic DISABLED for diagnostics"
               - micro_wake_word.stop:
               - voice_assistant.stop:
-              - microphone.stop_capture: i2s_mics
+              - microphone.stop_capture: clean_mic
     - priority: 375
       then:
         - sensor.template.publish:
@@ -126,6 +128,9 @@ esp32:
       CONFIG_SPIRAM_RODATA: "y"
       CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
 
+      # Kept even though the BLE package is gone: harmless with Bluetooth
+      # disabled, and it means re-adding a BLE package later does not silently
+      # revert to allocating Bluedroid's environment from internal RAM.
       CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
       CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
 
@@ -297,85 +302,170 @@ light:
             }
             head = (head + 1) % n;
 
-i2s_audio:
-  - id: i2s_output
-    i2s_lrclk_pin:
-      number: $i2s_lrclk
-      allow_other_uses: true
-    i2s_bclk_pin:
-      number: $i2s_bclk
-      allow_other_uses: true
-    i2s_mclk_pin:
-      number: $i2s_mclk
-
-  - id: i2s_input
-    i2s_lrclk_pin:
-      number: $i2s_lrclk
-      allow_other_uses: true
-    i2s_bclk_pin:
-      number: $i2s_bclk
-      allow_other_uses: true
-
-audio_adc:
-  - platform: es7210
-    id: adc_mic
-    i2c_id: internal_i2c
-    sample_rate: $i2s_sample_rate
-    bits_per_sample: $i2s_bps_mic
-
+# ---------------------------------------------------------------------------
+# Audio path: ESP-SR front end over a 4-slot TDM capture.
+#
+# The board's ES7210 is a four-channel ADC, and the schematic wires it as:
+#   ch1 (slot 0) MIC1_P/N      - left array mic
+#   ch2 (slot 1) MIC2_P/N      - right array mic
+#   ch3 (slot 2) ADC_MIC3_P/N  - the block marked AEC: the ES8311's OUTP/OUTN
+#                                fed back through a divider, i.e. an electrical
+#                                copy of what the speaker is playing
+#   ch4 (slot 3) ADC_MIC4_P/N  - coupling caps only, nothing drives it
+#
+# Reading slot 2 alongside the mics is what lets ESP-SR subtract the playback
+# from the capture, so the wake word survives music and TTS. The old config read
+# a plain stereo I2S frame and took the left channel only, which threw away both
+# the second mic and the reference.
+#
+# The reference is tapped after the DAC and before the amplifier. Volume is
+# applied digitally in the ES8311, so the tap tracks it; the fixed-gain NS4150B
+# downstream does not change the relationship.
+# ---------------------------------------------------------------------------
 external_components:
-  - source:
-      type: git
-      url: "https://github.com/sw3Dan/waveshare-s2-audio_esphome_voice"
-      ref: main
-    components: [ es8311 ]
-    refresh: 0s
+  - source: github://n-IA-hane/esphome-audio-stack@v2026.7.0
+    components: [esp_audio_stack, esp_afe]
 
-audio_dac:
-  - platform: es8311
-    id: es8311_dac
+esp_afe:
+  id: afe_processor
+  type: sr # wake-word/VA shape rather than the full-duplex fd pipeline
+  mode: low_cost
+  mic_num: 2
+  # SE/BSS is structural for a dual-mic AFE - the component rejects mic_num: 2
+  # without it. It also earns MIC2 its keep: spatial separation of the talker
+  # from everything else in the room.
+  se_enabled: true
+  aec_enabled: true
+  ns_enabled: true
+  # VAD and AGC stay off: micro_wake_word does its own gating, and AGC fights
+  # the analog gain staging on the ES7210 below.
+  vad_enabled: false
+  agc_enabled: false
+  # mic, mic, reference - the slot order after extraction.
+  input_format: mmr
+
+  # The feed and fetch rings default to internal RAM (~24.6 KB and ~8.2 KB).
+  # That is the difference between Bluedroid initialising and not: with them
+  # internal, BLE ran out during btc_init_bluetooth, BTU_StartUp bailed to
+  # BTU_ShutDown, and the teardown path dereferenced structures it had never
+  # allocated - a LoadProhibited panic in l2c_free, on a loop.
+  feed_buf_in_psram: true
+  feed_ring_in_psram: true
+  fetch_ring_in_psram: true
+
+esp_audio_stack:
+  id: audio_stack
+  processor_id: afe_processor
+  # 16k on the wire, which is what this board ran before the migration
+  # ($i2s_sample_rate was 16000) - so this is the known-good clocking, not a
+  # downgrade. The media pipelines still decode at 48k and the resampler
+  # speakers below bring them down, exactly as they always did.
+  #
+  # Running the bus at 48k instead costs three times the buffer memory on every
+  # stage and forces a 3-channel rate converter across the TDM frame, which is
+  # what the first two attempts died on. ESP-SR wants 16k regardless, so the
+  # upsample bought nothing.
+  sample_rate: 16000
+  output_sample_rate: 16000
+  # 32-bit slots: the ES7210 clocks TDM at 32 bits per slot regardless of how
+  # many bits actually carry signal.
+  bits_per_sample: 32
+  slot_bit_width: 32
+
+  i2s_mclk_pin: $i2s_mclk
+  i2s_bclk_pin: $i2s_bclk
+  i2s_lrclk_pin: $i2s_lrclk
+  i2s_din_pin: GPIO15
+  i2s_dout_pin: GPIO16
+
+  # Measured, not read off the schematic. Playing music and watching the slot
+  # level sensors: slot 1 sits at -60 dBFS when nothing plays - well below the
+  # room noise slot 0 hears - then jumps to -19 dBFS the moment playback starts,
+  # a 41 dB swing. That is an electrical tap, not a microphone. Slot 0 moves
+  # only 11 dB and hears the room constantly, which is what a mic does.
+  #
+  # So the ES7210 does not lay its channels across the TDM frame in MIC1..MIC4
+  # order. The frame is MIC1, MIC3, MIC2, MIC4 - the reference sits between the
+  # two mics. Same layout as the component's own ES7210 example, which is worth
+  # believing over the schematic's channel numbering.
+  use_tdm_reference: true
+  tdm_total_slots: 4
+  tdm_mic_slots: [0, 2]
+  tdm_ref_slot: 1 # the AEC tap
+  tdm_tx_slot: 0
+
+  # Not optional on this board. The frame buffers scale with slots x bit depth
+  # x resample ratio, and four 32-bit slots at 48k feeding a 16k processor works
+  # out to about 219 KB - rx, tdm_tx, tx_clock and tx_32 are ~49 KB each. The
+  # default is MALLOC_CAP_INTERNAL, and there is nowhere near that much internal
+  # RAM left once ESP-SR, the wifi buffers, BLE and the wake-word model have
+  # taken theirs: the first attempt died on "Audio buffer preallocation failed"
+  # with 140 KB free and a 131 KB largest block. These are not DMA buffers - the
+  # I2S descriptors are allocated separately by the IDF driver - so PSRAM is a
+  # correct home for them, and there are 5.3 MB of it going spare.
+  buffers_in_psram: true
+  audio_task_stack_in_psram: true
+
+  # Volume curve. The stack maps 0..1 exponentially from this floor up to 0 dB,
+  # and with the option omitted it defaults near -50 dB for hardware codec
+  # outputs. That made media_player's volume_max: 0.8 land at -10 dB, where the
+  # old path - ESPHome driving the ES8311's volume register through
+  # audio_dac: - was much flatter, so the same 0.4/0.8 limits suddenly sounded
+  # about 10 dB quieter. -30 dB restores roughly the previous loudness without
+  # touching the volume_max cap that keeps the amplifier out of clipping.
+  master_volume_min_db: -30.0
+
+  codec:
     i2c_id: internal_i2c
-    use_mclk: true
-    sample_rate: $i2s_sample_rate
-    bits_per_sample: $i2s_bps_spk
-    force_master: true
-    mclk_multiple: $i2s_mclk_multiple
+    input:
+      type: es7210
+      address: 0x40
+      gain_db: 30.0
+      # Per-channel override for the reference: the divider already puts the
+      # tap at line level, so it must not get the mics' 30 dB of PGA or it
+      # clips and AEC has nothing usable to subtract.
+      #
+      # This is NOT tdm_ref_slot and must not be kept in sync with it. It is a
+      # physical ES7210 ADC channel (MIC1=0 .. MIC4=3) passed to
+      # esp_codec_dev_set_in_channel_gain, whereas tdm_ref_slot is a position in
+      # the TDM frame. On this board the reference is MIC3, i.e. channel 2, but
+      # it lands in frame slot 1. Setting this to 1 to "match" hands the 0 dB
+      # override to MIC2 instead and leaves the second mic 30 dB down.
+      ref_channel: 2
+      ref_gain_db: 0.0
+    output:
+      type: es8311
+      address: 0x18
+      use_mclk: true
 
 microphone:
-  - platform: i2s_audio
-    id: i2s_mics
-    i2s_din_pin: GPIO15
-    adc_type: external
-    pdm: false
-    i2s_audio_id: i2s_input
-    i2s_mode: $i2s_mode_mic
-    sample_rate: 16000
-    bits_per_sample: $i2s_bps_mic
-    use_apll: $i2s_use_apll
-    mclk_multiple: $i2s_mclk_multiple
-    channel: ${mic_channel_${which_mic}}
+  - platform: esp_audio_stack
+    id: clean_mic
+    esp_audio_stack_id: audio_stack
 
 speaker:
-  - platform: i2s_audio
+  - platform: esp_audio_stack
     id: i2s_audio_speaker
-    i2s_dout_pin: GPIO16
-    i2s_audio_id: i2s_output
-    i2s_mode: secondary #using the patched es8311
-    dac_type: external
+    esp_audio_stack_id: audio_stack
     timeout: never
-    buffer_duration: 100ms
-    audio_dac: es8311_dac
-    sample_rate: $i2s_sample_rate
-    bits_per_sample: 16bit
-    use_apll: $i2s_use_apll
-    mclk_multiple: $i2s_mclk_multiple
-    channel: stereo
+    buffer_duration: 500ms
+    # The platform deliberately leaves sample_rate unset - it plays at whatever
+    # the bus runs at, resolved in C++ at setup(). The mixer below needs a
+    # concrete rate at config time, so state the bus rate explicitly. Keep this
+    # equal to esp_audio_stack's sample_rate. Same story for bits_per_sample:
+    # the platform clamps to 16-bit either way, but the mixer wants it stated.
+    sample_rate: 16000
+    bits_per_sample: 16
 
   # Virtual speakers to combine the announcement and media streams together into one output
+  #
+  # Mono, not stereo: a TDM bus places playback in tdm_tx_slot, so the stack
+  # disables stereo TX and the mixer has to match. No loss on this board - there
+  # is one NS4150B driving one speaker off PA_OUTL+/-.
   - platform: mixer
     id: mixing_speaker
     output_speaker: i2s_audio_speaker
-    num_channels: 2
+    num_channels: 1
     source_speakers:
       - id: announcement_mixing_input
         timeout: never
@@ -406,6 +496,7 @@ media_player:
     media_pipeline:
       speaker: media_resampling_speaker
       format: FLAC # FLAC is the least processor intensive codec
+      num_channels: 1 # follows the mono mixer above
       sample_rate: 48000
     on_announcement:
       - mixer_speaker.apply_ducking:
@@ -455,8 +546,10 @@ voice_assistant:
   id: va
   microphone:
     id: va_mic
-    microphone: i2s_mics
-    channels: $which_mic
+    microphone: clean_mic
+    # The stack publishes a single post-AEC mono stream, so there is no channel
+    # to pick any more.
+    channels: 0
   media_player: external_media_player
   micro_wake_word: mww
   use_wake_word: false
@@ -595,8 +688,8 @@ voice_assistant:
 micro_wake_word:
   id: mww
   microphone:
-    microphone: i2s_mics
-    channels: $which_mic
+    microphone: clean_mic
+    channels: 0
   stop_after_detection: false
   # Every loaded model runs inference on every frame, so an unused one is pure
   # CPU cost on the path that is already the tightest. okay_nabu was dropped
@@ -1158,6 +1251,21 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF # default OFF = mic works as usual
 
+  # A runtime A/B for the front end. Turning AEC off is the fastest way to tell
+  # "the wake word got worse because the canceller is misconfigured" apart from
+  # "the wake word got worse for some other reason" - flip it while music plays
+  # and see whether detection changes.
+  - platform: esp_afe
+    esp_afe_id: afe_processor
+    aec:
+      name: "Echo Cancellation"
+      entity_category: config
+      restore_mode: RESTORE_DEFAULT_ON
+    ns:
+      name: "Noise Suppression"
+      entity_category: config
+      restore_mode: RESTORE_DEFAULT_ON
+
   - platform: gpio
     id: amp_enable_8
     name: Amplifier
@@ -1179,19 +1287,19 @@ switch:
     turn_on_action:
       - lambda: |-
           id(mic_is_muted) = true;
-          id(adc_mic).set_mic_gain(0.0f);
+          id(audio_stack).set_mic_gain(0.0f);
       - script.execute:
           id: flash_ring
           r: 1.0
           g: 0.0
           b: 0.0
     turn_off_action:
-      # Unmute restores the gain the number entity holds. It used to restore a
+      # Unmute restores the trim the number entity holds. It used to restore a
       # separate mic_gain_saved global that nothing ever wrote to, so unmuting
       # always jumped to that global's initial 32 dB regardless of the setting.
       - lambda: |-
           id(mic_is_muted) = false;
-          id(adc_mic).set_mic_gain(id(mic_gain_db).state);
+          id(audio_stack).set_mic_gain(powf(10.0f, id(mic_digital_trim_db).state / 20.0f));
       # The measured purple the voice phases use - the ring is listening again.
       - script.execute:
           id: flash_ring
@@ -1257,20 +1365,26 @@ switch:
       - script.execute: control_leds
 
 number:
-  # Gain staging: take the level in the analog domain, not the digital one.
-  # mic_gain_db is the ES7210's PGA, ahead of the ADC, so it lifts the signal
-  # above the converter's noise floor - real SNR. gain_factor is a plain integer
-  # multiply applied to samples afterwards, which scales the noise up with the
-  # signal and hard-clips on overflow, so it buys nothing the PGA can't do
-  # better. Hence a high mic_gain_db and a low gain_factor.
+  # Gain staging changed when the audio stack took ownership of the codec.
+  #
+  # The analog PGA is still the right place to take level - it lifts the signal
+  # above the ADC's noise floor, which is real SNR that no digital multiply can
+  # recover. But it is now set once, at codec-open time, via the ES7210 block's
+  # gain_db: 30.0 above, because the stack exposes no runtime setter for it.
+  # That is the correct behaviour rather than a limitation: moving analog gain
+  # under a running canceller shifts the mic-to-reference relationship that AEC
+  # has already converged on, and it would take a moment to re-adapt every time
+  # the slider moved.
+  #
+  # What remains adjustable is a digital trim applied AFTER the front end, which
+  # is safe to change at any time. It is a different quantity from the old
+  # "Mic Gain (ES7210 dB)" entity, so it deliberately carries a new id: sharing
+  # one would let a device that had 30 stored in flash come back up applying
+  # thirty decibels of digital gain (a x31.6 multiply) and clip everything.
   #
   # micro_wake_word's microphone source deliberately has no gain_factor at all
   # (default 1): with the PGA set correctly it does not need one, and mWW is the
   # consumer that suffers most from clipped audio.
-  #
-  # These are initial_value only - restore_value means a device that has already
-  # stored a value keeps it, so changing these does nothing to a flashed device
-  # until you set them in HA or factory reset.
   #
   # These use on_value, not set_action, and both need optimistic: true.
   # set_action only runs from control(), i.e. when something actively sets the
@@ -1280,22 +1394,21 @@ number:
   # in setup(), and optimistic: true is what makes control() publish at all
   # (without it the entity also never updated in HA when you moved the slider).
   - platform: template
-    id: mic_gain_db
-    name: "Mic Gain (ES7210 dB)"
+    id: mic_digital_trim_db
+    name: "Mic Digital Trim (post-AEC dB)"
     entity_category: config
     optimistic: true
-    min_value: 0
-    max_value: 42
+    min_value: -20
+    max_value: 20
     step: 1
     restore_value: true
-    initial_value: 30
-    # Muted wins: set_mic_gain() called before the ES7210's own setup() is
-    # stored and applied by it, so a device that boots muted stays muted.
+    initial_value: 0
+    # Muted wins, same as before: a device that boots muted stays muted.
     on_value:
       - lambda: |-
-          id(adc_mic).set_mic_gain(id(mic_is_muted) ? 0.0f : x);
+          id(audio_stack).set_mic_gain(id(mic_is_muted) ? 0.0f : powf(10.0f, x / 20.0f));
       - logger.log:
-          format: "[MIC] Set ES7210 gain to %.0f dB"
+          format: "[MIC] Set post-AEC digital trim to %.0f dB"
           args: ["x"]
   - platform: template
     id: va_gain_factor
@@ -1400,16 +1513,17 @@ sensor:
   # without A/B-ing detection rate; use "Ambient sound level" from a separate
   # device if you want room-noise telemetry.
   #
-  # Kept commented out as a gain-tuning tool. Uncomment, flash, set mic_gain_db
-  # so that "Peak sound level" reads about -6 to -3 dB while you talk at the
-  # device from where you normally stand - that is the ADC's full scale, so 0 dB
-  # is already clipping - then comment it out again and reflash. Leaving it in
-  # while judging wake-word performance defeats the point of the A/B.
+  # Kept commented out as a gain-tuning tool. Uncomment, flash, adjust the
+  # ES7210 gain_db so that "Peak sound level" reads about -6 to -3 dB while you
+  # talk at the device from where you normally stand - that is the ADC's full
+  # scale, so 0 dB is already clipping - then comment it out again and reflash.
+  # Leaving it in while judging wake-word performance defeats the point of the
+  # A/B.
   #
   # - platform: sound_level
   #   microphone:
-  #     microphone: i2s_mics
-  #     channels: $which_mic
+  #     microphone: clean_mic
+  #     channels: 0
   #   passive: true
   #   measurement_duration: 1000ms
   #   rms:
@@ -1418,6 +1532,42 @@ sensor:
   #   peak:
   #     name: "Peak sound level"
   #     id: peak_sound_level
+
+  # Bring-up instruments for the TDM slot mapping. The slot assignments in the
+  # esp_audio_stack block are read off the schematic, not measured, and the
+  # whole thing is silently useless if they are wrong: AEC would be subtracting
+  # a mic from a mic. These answer it empirically.
+  #
+  # Play music with nobody talking: slot 2 should move and slots 0/1 should not.
+  # Then talk with nothing playing: slots 0 and 1 should move and slot 2 should
+  # not. Slot 3 should sit still throughout - nothing drives MIC4 on this board.
+  #
+  # Remove these once the mapping is confirmed; they are four more states a
+  # minute into the recorder for no ongoing benefit.
+  - platform: esp_audio_stack
+    esp_audio_stack_id: audio_stack
+    tdm_slot_levels:
+      - slot: 0
+        name: "Diag: TDM slot 0 (MIC1)"
+        entity_category: diagnostic
+      - slot: 1
+        name: "Diag: TDM slot 1 (MIC3 = AEC ref)"
+        entity_category: diagnostic
+      - slot: 2
+        name: "Diag: TDM slot 2 (MIC2)"
+        entity_category: diagnostic
+      - slot: 3
+        name: "Diag: TDM slot 3 (MIC4, unpopulated)"
+        entity_category: diagnostic
+
+  - platform: esp_afe
+    esp_afe_id: afe_processor
+    input_volume:
+      name: "Diag: AFE input volume"
+      entity_category: diagnostic
+    output_rms:
+      name: "Diag: AFE output RMS"
+      entity_category: diagnostic
 
 text_sensor:
   - platform: template

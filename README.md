@@ -68,6 +68,18 @@ substitutions:
 
 ## Smart speaker
 
+Needs ESPHome 2026.7.0+ and `framework: esp-idf`. The audio path runs on the
+[esphome-audio-stack](https://github.com/n-IA-hane/esphome-audio-stack) external
+component instead of ESPHome's `i2s_audio`, so that acoustic echo cancellation
+can use the board's hardware echo reference — the Waveshare schematic feeds the
+ES8311's output back into ES7210 channel 3 through a divider, and ESPHome's own
+ES7210 driver cannot read it because it does not do TDM. Without this the device
+goes deaf whenever it is playing anything.
+
+That component is young and has one maintainer, so pin a tag rather than
+tracking `main` (see "To stop tracking `main`" below). `v1-pre-aec` is the last
+release of this package before the migration if you need to go back.
+
 ```yaml
 esphome:
   name: smart-speak-living-room
