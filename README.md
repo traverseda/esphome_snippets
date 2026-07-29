@@ -80,6 +80,21 @@ That component is young and has one maintainer, so consider pinning a ref rather
 than tracking `main` (see "To stop tracking `main`" below) if you want
 reproducible builds.
 
+Multi-room grouping comes from [Sendspin](https://esphome.io/components/sendspin/),
+ESPHome's synchronised multi-room protocol (formerly "Resonate"). The package
+runs the hub and a `media_player: platform: speaker_source`, because ESPHome's
+older `media_player: platform: speaker` has no grouping at all — that is the
+only reason the media player changed platform. Two things follow from it:
+
+- Sendspin is **experimental** in ESPHome 2026.7 and its protocol is not
+  final, so a future ESPHome release may break this. Pin a ref if that matters.
+- Grouped audio arrives at 48 kHz and is resampled down to the 16 kHz duplex
+  bus the AEC front end runs on, so everything above 8 kHz is gone. Grouping
+  works; it is not hi-fi on this board.
+
+You get two media player entities: the device itself, and a `Group` player for
+whichever sendspin group it has joined.
+
 One thing the AEC path costs you is headroom. The old `i2s_audio` speaker handed
 the volume to the ES8311's own register, which goes to +32 dB, and full volume
 landed at +6.5 dB. `esp_audio_stack` applies volume as a software gain that
