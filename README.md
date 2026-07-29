@@ -76,9 +76,13 @@ ES8311's output back into ES7210 channel 3 through a divider, and ESPHome's own
 ES7210 driver cannot read it because it does not do TDM. Without this the device
 goes deaf whenever it is playing anything.
 
-That component is young and has one maintainer, so pin a tag rather than
-tracking `main` (see "To stop tracking `main`" below). `v1-pre-aec` is the last
-release of this package before the migration if you need to go back.
+That component is young and has one maintainer, so consider pinning a ref rather
+than tracking `main` (see "To stop tracking `main`" below) if you want
+reproducible builds.
+
+To go back to the pre-AEC audio path — ESPHome's own `i2s_audio` with the
+patched ES8311, one microphone, no echo cancellation, and the BLE beacon proxy
+still included — pin `ref: 13fe8f7`. That commit stays reachable on `main`.
 
 It also does not include the BLE beacon proxy, and cannot — see
 [Known limitation: a TV in the room](#known-limitation-a-tv-in-the-room) and
