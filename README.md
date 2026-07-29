@@ -80,6 +80,14 @@ That component is young and has one maintainer, so consider pinning a ref rather
 than tracking `main` (see "To stop tracking `main`" below) if you want
 reproducible builds.
 
+One thing the AEC path costs you is headroom. The old `i2s_audio` speaker handed
+the volume to the ES8311's own register, which goes to +32 dB, and full volume
+landed at +6.5 dB. `esp_audio_stack` applies volume as a software gain that
+stops at unity and clamps its codec curve at 0 dB, so the loudest this package
+can now get is 6.5 dB below the pre-AEC firmware. `volume_max: 1.0` recovers
+everything else. Lifting that ceiling needs a change in the audio-stack
+component, not in this file.
+
 To go back to the pre-AEC audio path — ESPHome's own `i2s_audio` with the
 patched ES8311, one microphone, no echo cancellation, and the BLE beacon proxy
 still included — pin `ref: 13fe8f7`. That commit stays reachable on `main`.

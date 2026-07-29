@@ -406,14 +406,18 @@ esp_audio_stack:
   buffers_in_psram: true
   audio_task_stack_in_psram: true
 
-  # Volume curve. The stack maps 0..1 exponentially from this floor up to 0 dB,
-  # and with the option omitted it defaults near -50 dB for hardware codec
-  # outputs. That made media_player's volume_max: 0.8 land at -10 dB, where the
-  # old path - ESPHome driving the ES8311's volume register through
-  # audio_dac: - was much flatter, so the same 0.4/0.8 limits suddenly sounded
-  # about 10 dB quieter. -30 dB restores roughly the previous loudness without
-  # touching the volume_max cap that keeps the amplifier out of clipping.
-  master_volume_min_db: -30.0
+  # No master_volume_min_db here, and that is deliberate - it is the wrong knob
+  # and it was set to -30 for a while on the theory that it was the right one.
+  # It only shapes the *hardware* master curve, i.e. the optional
+  # `number: platform: esp_audio_stack, master_volume:` entity, which this
+  # package does not create and which therefore sits pinned at 100% = 0 dB.
+  #
+  # The media player's volume never reaches that path. It runs
+  # resampler -> mixer -> this speaker -> ESPAudioStack::set_output_volume(),
+  # a software q31 gain whose floor is the component's hardcoded
+  # SOFTWARE_VOLUME_MIN_DB of -49 dB, linear in dB from there to 0 dB at 1.0.
+  # See the volume_min/volume_max comment on the media player below for what
+  # that costs against the old audio_dac path and why the limits changed.
 
   codec:
     i2c_id: internal_i2c
@@ -486,8 +490,31 @@ media_player:
     name: None
     internal: False
     volume_increment: 0.01
-    volume_min: 0.4
-    volume_max: 0.8
+    # Volume limits, and why they are no longer 0.4/0.8.
+    #
+    # These are the ends of a remap: HA's 0..100% becomes volume_min..volume_max,
+    # which the speaker chain hands to ESPAudioStack::set_output_volume() - a
+    # software gain that is linear in dB from -49 dB at 0.0 to 0 dB at 1.0.
+    # 0.8 therefore meant -9.8 dB, and full volume was a tenth of the power it
+    # could have been.
+    #
+    # The old i2s_audio speaker had `audio_dac: es8311_dac`, so the same 0.8 went
+    # to the ES8311's volume register instead: 0.8 * 255 = 204, and 0xBF is 0 dB
+    # at 0.5 dB a step, i.e. *+6.5 dB*. That is the 16 dB that went missing in
+    # the migration, and it is why this got quieter than it used to be.
+    #
+    # 1.0 buys 9.8 dB of it back. The last 6.5 dB is not reachable from YAML:
+    # esp_audio_stack clamps both its volume curves at 0 dB, so unity really is
+    # the ceiling now. It would need the component to allow a positive
+    # master_volume_max_db - the ES8311 register goes to +32 dB and
+    # esp_codec_dev_set_vol_curve takes a float - or ESPHome's es8311 audio_dac
+    # driving the same chip the stack is already driving, which is worse than
+    # being 6.5 dB down.
+    #
+    # volume_min drops to match: on the old ES8311 curve 0.4 was -44.5 dB, and
+    # 0.1 on this one is -44.1 dB, so the bottom of the HA slider is unchanged.
+    volume_min: 0.1
+    volume_max: 1.0
     announcement_pipeline:
       speaker: announcement_resampling_speaker
       format: FLAC # FLAC is the least processor intensive codec
