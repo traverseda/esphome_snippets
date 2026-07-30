@@ -1015,7 +1015,13 @@ script:
           }
           if (init_progress) {
             if (wifi_connected) set("Rainbow Slow", 0.9, 0.1, 0.85); else set("Rainbow Slow", 1.0, 0.1, 0.1);
-            id(play_sound).execute(true, "wake_word_triggered_sound");
+            // No chime here. control_leds runs from on_boot at priority 375, which
+            // is inside the window where esp_audio_stack's task is still bringing
+            // up I2S and the codecs (~150ms of AFE reinit, ~110ms speaker setup).
+            // The old platform: speaker media player tolerated a play that early;
+            // speaker_source hands it straight to a media source, and the result is
+            // a pop instead of the chime and an output path that stays silent for
+            // the rest of the session. The ring already signals init on its own.
             return;
           }
           if (!wifi_connected || !api_connected) {
