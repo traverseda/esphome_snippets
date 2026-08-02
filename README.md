@@ -80,49 +80,6 @@ That component is young and has one maintainer, so consider pinning a ref rather
 than tracking `main` (see "To stop tracking `main`" below) if you want
 reproducible builds.
 
-Multi-room grouping comes from [Sendspin](https://esphome.io/components/sendspin/),
-ESPHome's synchronised multi-room protocol (formerly "Resonate"). The package
-runs the hub and a `media_player: platform: speaker_source`, because ESPHome's
-older `media_player: platform: speaker` has no grouping at all — that is the
-only reason the media player changed platform. Two things follow from it:
-
-- Sendspin is **experimental** in ESPHome 2026.7 and its protocol is not
-  final, so a future ESPHome release may break this. Pin a ref if that matters.
-- Grouped audio arrives at 48 kHz and is resampled down to the 16 kHz duplex
-  bus the AEC front end runs on, so everything above 8 kHz is gone. Grouping
-  works; it is not hi-fi on this board.
-
-You get two media player entities: the device itself, and a `Group` player for
-whichever sendspin group it has joined.
-
-### Never play audio during boot
-
-`speaker_source` hands a URI straight to a media source, which starts a decoder
-against the output path. Do that while `esp_audio_stack`'s task is still bringing
-up I2S and the codecs — the first second or so; a healthy boot log shows ~150 ms
-of AFE reinit and a 110 ms speaker setup in there — and the device emits a single
-**pop** instead of the sound and then plays *nothing at all* for the rest of the
-session. No music, no TTS, no chimes. It is effectively a microphone until you
-reboot it.
-
-The failure is completely silent, which is what made it expensive to find: the
-media player reports `IDLE` and `is_ready()`, every media source reports `IDLE`,
-no component is marked failed, and not one warning or error is logged. URIs are
-accepted and dropped. The only outward tell is the pop.
-
-`control_leds` used to fire the wake chime from `on_boot` at priority 375 while
-`init_in_progress`, which landed in that window roughly half the time — so about
-half of all hard resets produced a mute speaker. It doesn't any more. **If you add
-sounds of your own, don't play them from an early `on_boot`**; gate them on
-`id(audio_stack)->is_running()`.
-
-Two related notes. The pop you still hear at boot is a different, harmless thing:
-PA_EN is a `restore_mode: RESTORE_DEFAULT_ON` GPIO switch, so the amplifier is
-enabled during setup before the DAC output has settled, and the pre-AEC firmware
-does it too. And if you hard-reset a device repeatedly right after an OTA, ESP-IDF
-can roll back to the previous slot before ESPHome marks the new image valid —
-check the compile timestamp before concluding a change didn't work.
-
 One thing the AEC path costs you is headroom. The old `i2s_audio` speaker handed
 the volume to the ES8311's own register, which goes to +32 dB, and full volume
 landed at +6.5 dB. `esp_audio_stack` applies volume as a software gain that
