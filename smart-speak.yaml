@@ -141,6 +141,16 @@ psram:
   mode: octal
   speed: 80MHz
 
+# Sendspin hub, plus its media_source. Still not wired to a speaker/media_player
+# yet - that is the next step. See esphome.io/components/sendspin/ - ESP32-only,
+# needs mDNS and TCP 8928 reachable to the Sendspin server.
+sendspin:
+  id: sendspin_hub
+
+media_source:
+  - platform: sendspin
+    id: sendspin_media_source
+
 # Credentials (and the fallback ap:) come from your own config; this block
 # only claims the id the LED scripts read and the connection-state triggers.
 wifi:
@@ -475,6 +485,8 @@ speaker:
         timeout: never
       - id: media_mixing_input
         timeout: never
+      - id: sendspin_mixing_input
+        timeout: never
 
   # Virtual speakers to resample each pipeline's audio, as the mixer speaker requires the same sample rate
   - platform: resampler
@@ -483,6 +495,9 @@ speaker:
   - platform: resampler
     id: media_resampling_speaker
     output_speaker: media_mixing_input
+  - platform: resampler
+    id: sendspin_resampling_speaker
+    output_speaker: sendspin_mixing_input
 
 media_player:
   - platform: speaker
@@ -539,6 +554,7 @@ media_player:
                 voice_assistant.is_running:
             - not:
                 media_player.is_announcing:
+                  id: external_media_player
         then:
           - mixer_speaker.apply_ducking:
               id: media_mixing_input
@@ -568,6 +584,17 @@ media_player:
         file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
       - id: error_cloud_expired
         file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
+
+  # Sendspin's own media_player entity, entirely separate from the one above.
+  # It feeds sendspin_media_source into its own resampler/mixer input, so it
+  # plays alongside announcements/media rather than through them.
+  - platform: speaker_source
+    id: sendspin_media_player
+    name: "Sendspin"
+    media_pipeline:
+      speaker: sendspin_resampling_speaker
+      sources:
+        - sendspin_media_source
 
 voice_assistant:
   id: va
@@ -761,8 +788,10 @@ micro_wake_word:
                       - if:
                           condition:
                             media_player.is_announcing:
+                              id: external_media_player
                           then:
                             - media_player.stop:
+                                id: external_media_player
                                 announcement: true
                           else:
                             - if:
@@ -954,7 +983,6 @@ script:
           }
           if (init_progress) {
             if (wifi_connected) set("Rainbow Slow", 0.9, 0.1, 0.85); else set("Rainbow Slow", 1.0, 0.1, 0.1);
-            id(play_sound).execute(1, id(wake_word_triggered_sound));
             return;
           }
           if (!wifi_connected || !api_connected) {
@@ -1124,6 +1152,7 @@ script:
             - wait_until:
                 not:
                   media_player.is_announcing:
+                    id: external_media_player
             - if:
                 condition:
                   switch.is_off: timer_ringing
@@ -1393,8 +1422,10 @@ switch:
       - if:
           condition:
             media_player.is_announcing:
+              id: external_media_player
           then:
             media_player.stop:
+              id: external_media_player
               announcement: true
       - mixer_speaker.apply_ducking:
           id: media_mixing_input
