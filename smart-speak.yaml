@@ -311,6 +311,68 @@ light:
                             (uint8_t) (current_color.blue * level));
             }
             head = (head + 1) % n;
+      # A VU-style bar that grows around the ring with how loud the speaker is
+      # playing. Reads TDM slot 1, the AEC reference tap wired to the ES8311's
+      # output (see the esp_audio_stack block below) - an electrical copy of
+      # what is being played, not a microphone, so it is unaffected by room
+      # acoustics or how loud the mics happen to be. -60/-19 dBFS are this
+      # board's measured idle/playing figures for that slot, same numbers the
+      # tdm_slot_levels sensors below are commented against.
+      #
+      # get_tdm_slot_level_dbfs() is a lock-free atomic read updated by the
+      # audio task on every RX frame (divided by 8, so a few times a second),
+      # independent of whether any tdm_slot_levels sensor is enabled or the
+      # "Debug: audio diagnostics" switch is on - both only gate what gets
+      # published to HA, not whether the level itself is computed.
+      - addressable_lambda:
+          name: "Sound Reactive"
+          update_interval: 60ms
+          lambda: |-
+            static float level = 0.0f;
+            if (initial_run) level = 0.0f;
+            float target = (id(audio_stack).get_tdm_slot_level_dbfs(1) + 60.0f) / 45.0f;
+            if (target < 0.0f) target = 0.0f;
+            if (target > 1.0f) target = 1.0f;
+            level += (target - level) * 0.3f;  // one-pole smoothing so it doesn't strobe frame to frame
+            const int n = it.size();
+            const float lit = level * n;
+            for (int i = 0; i < n; i++) {
+              float b;
+              if (i < (int) lit) b = 1.0f;
+              else if (i == (int) lit) b = lit - (int) lit;  // partial pixel at the boundary
+              else b = 0.05f;  // faint so the ring outline stays visible when quiet
+              it[i] = Color((uint8_t) (current_color.red * b),
+                            (uint8_t) (current_color.green * b),
+                            (uint8_t) (current_color.blue * b));
+            }
+      # Same VU bar, but for the room instead of the speaker: averages TDM
+      # slots 0 and 2 (MIC1/MIC2, the two array mics - see esp_audio_stack
+      # below). Floor/ceiling here are a starting guess, not measured like the
+      # playback tap's - retune against "Diag: TDM slot 0/2" with "Debug:
+      # audio diagnostics" on if this reads too hot or too flat in your room.
+      - addressable_lambda:
+          name: "Mic Reactive"
+          update_interval: 60ms
+          lambda: |-
+            static float level = 0.0f;
+            if (initial_run) level = 0.0f;
+            const float dbfs = (id(audio_stack).get_tdm_slot_level_dbfs(0) +
+                                 id(audio_stack).get_tdm_slot_level_dbfs(2)) / 2.0f;
+            float target = (dbfs + 55.0f) / 35.0f;
+            if (target < 0.0f) target = 0.0f;
+            if (target > 1.0f) target = 1.0f;
+            level += (target - level) * 0.3f;
+            const int n = it.size();
+            const float lit = level * n;
+            for (int i = 0; i < n; i++) {
+              float b;
+              if (i < (int) lit) b = 1.0f;
+              else if (i == (int) lit) b = lit - (int) lit;
+              else b = 0.05f;
+              it[i] = Color((uint8_t) (current_color.red * b),
+                            (uint8_t) (current_color.green * b),
+                            (uint8_t) (current_color.blue * b));
+            }
 
 # ---------------------------------------------------------------------------
 # Audio path: ESP-SR front end over a 4-slot TDM capture.
@@ -545,21 +607,30 @@ media_player:
           id: media_mixing_input
           decibel_reduction: 20
           duration: 0.0s
+      - mixer_speaker.apply_ducking:
+          id: sendspin_mixing_input
+          decibel_reduction: 20
+          duration: 0.0s
     on_state:
-      if:
-        condition:
-          and:
-            - switch.is_off: timer_ringing
-            - not:
-                voice_assistant.is_running:
-            - not:
-                media_player.is_announcing:
-                  id: external_media_player
-        then:
-          - mixer_speaker.apply_ducking:
-              id: media_mixing_input
-              decibel_reduction: 0
-              duration: 1.0s
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - not:
+                  voice_assistant.is_running:
+              - not:
+                  media_player.is_announcing:
+                    id: external_media_player
+          then:
+            - mixer_speaker.apply_ducking:
+                id: media_mixing_input
+                decibel_reduction: 0
+                duration: 1.0s
+            - mixer_speaker.apply_ducking:
+                id: sendspin_mixing_input
+                decibel_reduction: 0
+                duration: 1.0s
+      - script.execute: control_leds
     on_mute:
       - delay: 100ms # Debounce
       - script.execute: control_leds_volume_changed
@@ -595,6 +666,8 @@ media_player:
       speaker: sendspin_resampling_speaker
       sources:
         - sendspin_media_source
+    on_state:
+      - script.execute: control_leds
 
 voice_assistant:
   id: va
@@ -648,6 +721,10 @@ voice_assistant:
         id: media_mixing_input
         decibel_reduction: 30
         duration: 0.0s
+    - mixer_speaker.apply_ducking:
+        id: sendspin_mixing_input
+        decibel_reduction: 30
+        duration: 0.0s
   on_listening:
     - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
     - script.execute: control_leds
@@ -699,6 +776,10 @@ voice_assistant:
           voice_assistant.is_running:
     - mixer_speaker.apply_ducking:
         id: media_mixing_input
+        decibel_reduction: 0
+        duration: 1.0s
+    - mixer_speaker.apply_ducking:
+        id: sendspin_mixing_input
         decibel_reduction: 0
         duration: 1.0s
     - if:
@@ -831,6 +912,50 @@ globals:
     type: float
     restore_value: no
     initial_value: '0.8'
+  # Per-stage LED effect, editable from HA (select entities below) and
+  # persisted like saved_alarm_action is - restore_value on both the select
+  # and its backing global. Colour stays hardcoded in control_leds; only the
+  # effect (Pulse Fast, Comet, solid, ...) is configurable per stage.
+  - id: effect_waiting_for_command
+    type: std::string
+    restore_value: yes
+    initial_value: '"solid"'
+  - id: effect_listening_for_command
+    type: std::string
+    restore_value: yes
+    initial_value: '"Pulse Fast"'
+  - id: effect_thinking
+    type: std::string
+    restore_value: yes
+    initial_value: '"Comet"'
+  - id: effect_replying
+    type: std::string
+    restore_value: yes
+    initial_value: '"Pulse Slow"'
+  - id: effect_error
+    type: std::string
+    restore_value: yes
+    initial_value: '"Pulse Fast"'
+  - id: effect_not_ready
+    type: std::string
+    restore_value: yes
+    initial_value: '"Pulse Slow"'
+  - id: effect_muted
+    type: std::string
+    restore_value: yes
+    initial_value: '"solid"'
+  - id: effect_timers_active
+    type: std::string
+    restore_value: yes
+    initial_value: '"Pulse Slow"'
+  - id: effect_ringing
+    type: std::string
+    restore_value: yes
+    initial_value: '"Pulse Fast"'
+  - id: effect_playing_music
+    type: std::string
+    restore_value: yes
+    initial_value: '"Pulse Slow"'
   # Which TDM slot the audio stack is currently using as the AEC reference, so
   # debug_ref_slot can skip the bus restart when the value has not actually
   # changed. Must match tdm_ref_slot in the esp_audio_stack block.
@@ -961,14 +1086,16 @@ script:
           const bool init_progress  = id(init_in_progress);
           const bool muted          = id(mic_is_muted);
           const int  phase          = id(voice_assistant_phase);
+          const bool playing_music  = id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING ||
+                                       id(sendspin_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING;
 
           id(check_if_timers_active).execute();
           const bool timers_active = id(is_timer_active);
 
           ESP_LOGD("led",
-                   "control_leds: wifi=%d api=%d improv=%d init=%d ringing=%d timers_active=%d muted=%d phase=%d",
+                   "control_leds: wifi=%d api=%d improv=%d init=%d ringing=%d timers_active=%d muted=%d phase=%d playing_music=%d",
                    (int)wifi_connected, (int)api_connected, (int)improv_ble, (int)init_progress,
-                   (int)ringing, (int)timers_active, (int)muted, phase);
+                   (int)ringing, (int)timers_active, (int)muted, phase, (int)playing_music);
 
           auto set = [&](const char* effect, float r, float g, float b) {
             id(led_set_effect).execute(effect, r, g, b, id(led_ring_brightness).state);
@@ -990,7 +1117,7 @@ script:
             return;
           }
           if (ringing) {
-            set("Pulse Fast", 0.0, 1.0, 0.2);
+            set(id(effect_ringing).c_str(), 0.0, 1.0, 0.2);
             return;
           }
 
@@ -1003,24 +1130,26 @@ script:
           // derived. The previous 0.55/0.0/1.0 read as blue, because a WS2812's
           // blue die is far brighter than its red at equal PWM. All three
           // phases share the one hue; the effect is what tells them apart.
+          // Effects are configurable per stage (see the select: entities
+          // below) - only the colour stays fixed here.
           switch (phase) {
             case ${voice_assist_waiting_for_command_phase_id}:
-              set("solid", 1.0, 0.11, 0.945);         // awake, waiting for you
+              set(id(effect_waiting_for_command).c_str(), 1.0, 0.11, 0.945);    // awake, waiting for you
               return;
             case ${voice_assist_listening_for_command_phase_id}:
-              set("Pulse Fast", 1.0, 0.11, 0.945);    // hearing you speak
+              set(id(effect_listening_for_command).c_str(), 1.0, 0.11, 0.945); // hearing you speak
               return;
             case ${voice_assist_thinking_phase_id}:
-              set("Comet", 1.0, 0.11, 0.945);         // spinning = working
+              set(id(effect_thinking).c_str(), 1.0, 0.11, 0.945);              // spinning = working
               return;
             case ${voice_assist_replying_phase_id}:
-              set("Pulse Slow", 0.0, 0.35, 1.0);      // its turn to talk
+              set(id(effect_replying).c_str(), 0.0, 0.35, 1.0);                // its turn to talk
               return;
             case ${voice_assist_error_phase_id}:
-              set("Pulse Fast", 1.0, 0.0, 0.0);
+              set(id(effect_error).c_str(), 1.0, 0.0, 0.0);
               return;
             case ${voice_assist_not_ready_phase_id}:
-              set("Pulse Slow", 1.0, 0.0, 0.0);
+              set(id(effect_not_ready).c_str(), 1.0, 0.0, 0.0);
               return;
             default: break;
           }
@@ -1031,12 +1160,22 @@ script:
           // with nothing on the ring to explain it. It stays below ringing and
           // below every voice phase, which are all momentary.
           if (muted) {
-            set_dim("solid", 1.0, 0.0, 0.0, 0.12);
+            set_dim(id(effect_muted).c_str(), 1.0, 0.0, 0.0, 0.12);
             return;
           }
 
           if (timers_active) {
-            set("Pulse Slow", 0.0, 1.0, 0.2);
+            set(id(effect_timers_active).c_str(), 0.0, 1.0, 0.2);
+            return;
+          }
+
+          // Lowest-priority resting state: teal, so it reads apart from the
+          // purple/blue voice phases, the red error/muted states and the
+          // green timer states. Anything above still outranks it, same as it
+          // outranks plain "off" - a kitchen timer or a mute should still be
+          // visible over quiet background music.
+          if (playing_music) {
+            set(id(effect_playing_music).c_str(), 0.0, 0.8, 0.8);
             return;
           }
 
@@ -1319,6 +1458,151 @@ select:
         - lambda: |-
             id(saved_alarm_action) = x;
 
+  # Per-stage LED ring effects. Colour per stage is fixed in control_leds -
+  # see the comment there - but which animation plays is user-configurable
+  # and persisted, same restore_value pattern as Alarm action above. Options
+  # deliberately exclude "off": an "off" indicator for e.g. Listening would
+  # read as the device having gone unresponsive rather than as a choice.
+  - platform: template
+    name: "LED Effect: Waiting for command"
+    id: select_effect_waiting_for_command
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: solid
+    options: &led_effect_options
+      - solid
+      - Pulse Slow
+      - Pulse Medium
+      - Pulse Fast
+      - Rainbow Slow
+      - Wipe
+      - Comet
+      - Sound Reactive
+      - Mic Reactive
+    on_value:
+      then:
+        - lambda: id(effect_waiting_for_command) = x;
+        - script.execute: control_leds
+  - platform: template
+    name: "LED Effect: Listening"
+    id: select_effect_listening_for_command
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Pulse Fast
+    options: *led_effect_options
+    on_value:
+      then:
+        - lambda: id(effect_listening_for_command) = x;
+        - script.execute: control_leds
+  - platform: template
+    name: "LED Effect: Thinking"
+    id: select_effect_thinking
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Comet
+    options: *led_effect_options
+    on_value:
+      then:
+        - lambda: id(effect_thinking) = x;
+        - script.execute: control_leds
+  - platform: template
+    name: "LED Effect: Replying"
+    id: select_effect_replying
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Pulse Slow
+    options: *led_effect_options
+    on_value:
+      then:
+        - lambda: id(effect_replying) = x;
+        - script.execute: control_leds
+  - platform: template
+    name: "LED Effect: Error"
+    id: select_effect_error
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Pulse Fast
+    options: *led_effect_options
+    on_value:
+      then:
+        - lambda: id(effect_error) = x;
+        - script.execute: control_leds
+  - platform: template
+    name: "LED Effect: Not ready"
+    id: select_effect_not_ready
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Pulse Slow
+    options: *led_effect_options
+    on_value:
+      then:
+        - lambda: id(effect_not_ready) = x;
+        - script.execute: control_leds
+  - platform: template
+    name: "LED Effect: Muted"
+    id: select_effect_muted
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: solid
+    options: *led_effect_options
+    on_value:
+      then:
+        - lambda: id(effect_muted) = x;
+        - script.execute: control_leds
+  - platform: template
+    name: "LED Effect: Timer active"
+    id: select_effect_timers_active
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Pulse Slow
+    options: *led_effect_options
+    on_value:
+      then:
+        - lambda: id(effect_timers_active) = x;
+        - script.execute: control_leds
+  - platform: template
+    name: "LED Effect: Timer ringing"
+    id: select_effect_ringing
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Pulse Fast
+    options: *led_effect_options
+    on_value:
+      then:
+        - lambda: id(effect_ringing) = x;
+        - script.execute: control_leds
+  - platform: template
+    name: "LED Effect: Playing music"
+    id: select_effect_playing_music
+    icon: mdi:led-strip-variant
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: Pulse Slow
+    options: *led_effect_options
+    on_value:
+      then:
+        - lambda: id(effect_playing_music) = x;
+        - script.execute: control_leds
+
 switch:
   - platform: template
     id: diag_disable_mic
@@ -1431,10 +1715,18 @@ switch:
           id: media_mixing_input
           decibel_reduction: 0
           duration: 1.0s
+      - mixer_speaker.apply_ducking:
+          id: sendspin_mixing_input
+          decibel_reduction: 0
+          duration: 1.0s
       - script.execute: control_leds
     on_turn_on:
       - mixer_speaker.apply_ducking:
           id: media_mixing_input
+          decibel_reduction: 20
+          duration: 0.0s
+      - mixer_speaker.apply_ducking:
+          id: sendspin_mixing_input
           decibel_reduction: 20
           duration: 0.0s
       - micro_wake_word.enable_model: stop
