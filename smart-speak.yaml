@@ -97,11 +97,7 @@ esphome:
         - lambda: |-
             id(alarm_time).publish_state(id(saved_alarm_time));
         - lambda: |-
-            auto call = id(alarm_action).make_call();
-            call.set_option(id(saved_alarm_action));
-            call.perform();
-        - lambda: |-
-            setenv("TZ", id(saved_time_zone).c_str(), 1);
+            setenv("TZ", id(saved_time_zone), 1);
             tzset();
         # Seed the system clock from the onboard RTC before HA is reachable, so
         # the alarm survives an HA restart. Runs after the TZ restore above so
@@ -200,7 +196,8 @@ api:
               isdigit(alarm_time_hh_mm[0]) && isdigit(alarm_time_hh_mm[1]) &&
               isdigit(alarm_time_hh_mm[3]) && isdigit(alarm_time_hh_mm[4])) {
                 id(alarm_time).publish_state(alarm_time_hh_mm);
-                id(saved_alarm_time) = alarm_time_hh_mm;
+                strncpy(id(saved_alarm_time), alarm_time_hh_mm.c_str(), sizeof(id(saved_alarm_time)) - 1);
+                id(saved_alarm_time)[sizeof(id(saved_alarm_time)) - 1] = '\0';
               }
     - action: set_time_zone
       variables:
@@ -209,7 +206,8 @@ api:
         - lambda: |-
             setenv("TZ", posix_time_zone.c_str(), 1);
             tzset();
-            id(saved_time_zone) = posix_time_zone;
+            strncpy(id(saved_time_zone), posix_time_zone.c_str(), sizeof(id(saved_time_zone)) - 1);
+            id(saved_time_zone)[sizeof(id(saved_time_zone)) - 1] = '\0';
             id(publish_current_time).execute();
   on_client_connected:
     - script.execute: control_leds
@@ -976,18 +974,23 @@ globals:
     type: int
     restore_value: no
     initial_value: ${voice_assist_not_ready_phase_id}
+  # char arrays, not std::string: these two are the ones the effect-select
+  # globals above turned out not to be the whole story on. They predate this
+  # file's first commit and still had restore_value: yes on a std::string,
+  # the same raw sizeof(T) flash copy that corrupted the heap up there - a
+  # std::string's short-string-optimization buffer holds a self-pointer into
+  # the object's own memory, so even a 5-character "HH:MM" is unsafe to
+  # restore by byte copy; the pointer comes back aimed at wherever the
+  # object used to live, not wherever it lives now. A fixed char array has
+  # no pointers in its representation, so the same byte copy is safe.
   - id: saved_alarm_time
-    type: std::string
+    type: char[16]
     restore_value: yes
     initial_value: '"Unknown"'
   - id: saved_time_zone
-    type: std::string
+    type: char[48]
     restore_value: yes
     initial_value: '"UTC0"'
-  - id: saved_alarm_action
-    type: std::string
-    restore_value: yes
-    initial_value: '"Play sound"'
   - id: first_active_timer
     type: voice_assistant::Timer
     restore_value: no
@@ -1449,15 +1452,12 @@ select:
     name: "Alarm action"
     id: alarm_action
     icon: mdi:bell-plus
+    restore_value: true
     options:
       - "Play sound"
       - "Send event"
       - "Sound and event"
     initial_option: "Play sound"
-    on_value:
-      then:
-        - lambda: |-
-            id(saved_alarm_action) = x;
 
   # Per-stage LED ring effects. Colour per stage is fixed in control_leds -
   # see the comment there - but which animation plays is user-configurable
