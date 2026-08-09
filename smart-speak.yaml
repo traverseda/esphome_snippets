@@ -366,44 +366,288 @@ light:
                             (uint8_t) (current_color.blue * b));
             }
 
-  # Software-only RGB light: HA renders a real color wheel for it, same as
-  # it would for Status Ring above, because color_mode is a property of any
-  # `light` entity, not something specific to a physical LED strip. Backed
-  # by the three template outputs below rather than real hardware - picking
-  # a color here doesn't touch the ring yet. See the "output:" comment below
-  # for why this needs template outputs instead of a template light platform.
+  # Per-stage light widgets: same shape as Status Ring's own card above
+  # (color wheel, brightness, power, an effect chip) - one per control_leds
+  # state, replacing the old select+picker pair with a single widget per
+  # stage. Software-only for now, same deal as before: backed by template
+  # outputs into per-stage globals below, nothing reads them into the real
+  # ring yet.
+  #
+  # Effects here are Pulse only, not the full catalog Status Ring has.
+  # Rainbow/Wipe/Comet/Sound Reactive/Mic Reactive all need per-pixel write
+  # access to a real addressable strip (see addressable_lambda etc. on
+  # Status Ring above) - a software-only light has no pixels to address.
+  # Matching those exactly would mean partitioning Status Ring's actual
+  # LEDs per stage instead (light: platform: partition), which starts
+  # actually driving the physical ring the moment you touch one of these -
+  # a bigger step than proving the widget shows up correctly.
   - platform: rgb
-    id: custom_ring_color
-    name: "LED Custom Color"
-    icon: mdi:palette
+    id: light_waiting_for_command
+    name: "LED: Waiting for command"
     entity_category: config
-    red: custom_color_r_out
-    green: custom_color_g_out
-    blue: custom_color_b_out
+    icon: mdi:led-strip-variant
+    red: color_waiting_for_command_r_out
+    green: color_waiting_for_command_g_out
+    blue: color_waiting_for_command_b_out
+    effects: &stage_pulse_effects
+      - pulse:
+          name: "Pulse Slow"
+          min_brightness: 30%
+          max_brightness: 100%
+          transition_length: 2000ms
+          update_interval: 3000ms
+      - pulse:
+          name: "Pulse Medium"
+          min_brightness: 30%
+          max_brightness: 100%
+          transition_length: 600ms
+          update_interval: 1200ms
+      - pulse:
+          name: "Pulse Fast"
+          min_brightness: 30%
+          max_brightness: 100%
+          transition_length: 300ms
+          update_interval: 600ms
+  - platform: rgb
+    id: light_listening_for_command
+    name: "LED: Listening"
+    entity_category: config
+    icon: mdi:led-strip-variant
+    red: color_listening_for_command_r_out
+    green: color_listening_for_command_g_out
+    blue: color_listening_for_command_b_out
+    effects: *stage_pulse_effects
+  - platform: rgb
+    id: light_thinking
+    name: "LED: Thinking"
+    entity_category: config
+    icon: mdi:led-strip-variant
+    red: color_thinking_r_out
+    green: color_thinking_g_out
+    blue: color_thinking_b_out
+    effects: *stage_pulse_effects
+  - platform: rgb
+    id: light_replying
+    name: "LED: Replying"
+    entity_category: config
+    icon: mdi:led-strip-variant
+    red: color_replying_r_out
+    green: color_replying_g_out
+    blue: color_replying_b_out
+    effects: *stage_pulse_effects
+  - platform: rgb
+    id: light_error
+    name: "LED: Error"
+    entity_category: config
+    icon: mdi:led-strip-variant
+    red: color_error_r_out
+    green: color_error_g_out
+    blue: color_error_b_out
+    effects: *stage_pulse_effects
+  - platform: rgb
+    id: light_not_ready
+    name: "LED: Not ready"
+    entity_category: config
+    icon: mdi:led-strip-variant
+    red: color_not_ready_r_out
+    green: color_not_ready_g_out
+    blue: color_not_ready_b_out
+    effects: *stage_pulse_effects
+  - platform: rgb
+    id: light_muted
+    name: "LED: Muted"
+    entity_category: config
+    icon: mdi:led-strip-variant
+    red: color_muted_r_out
+    green: color_muted_g_out
+    blue: color_muted_b_out
+    effects: *stage_pulse_effects
+  - platform: rgb
+    id: light_timers_active
+    name: "LED: Timer active"
+    entity_category: config
+    icon: mdi:led-strip-variant
+    red: color_timers_active_r_out
+    green: color_timers_active_g_out
+    blue: color_timers_active_b_out
+    effects: *stage_pulse_effects
+  - platform: rgb
+    id: light_ringing
+    name: "LED: Timer ringing"
+    entity_category: config
+    icon: mdi:led-strip-variant
+    red: color_ringing_r_out
+    green: color_ringing_g_out
+    blue: color_ringing_b_out
+    effects: *stage_pulse_effects
+  - platform: rgb
+    id: light_playing_music
+    name: "LED: Playing music"
+    entity_category: config
+    icon: mdi:led-strip-variant
+    red: color_playing_music_r_out
+    green: color_playing_music_g_out
+    blue: color_playing_music_b_out
+    effects: *stage_pulse_effects
 
-# Backing outputs for the "LED Custom Color" picker below. There's no
+# Backing outputs for the per-stage light widgets above. There's no
 # `light: platform: template` in ESPHome (unlike select/number/switch, which
 # do have a template platform) - the documented way to get a software-only
 # RGB light is three float outputs feeding `light: platform: rgb`. Each
-# output's write_action just stashes the value in the same globals
-# set_led_color already writes to; nothing reads them for real yet - that's
-# the next step, once this is confirmed showing up in HA.
+# output's write_action just stashes the value in a per-stage global;
+# nothing reads them for real yet - that's the next step, once this is
+# confirmed showing up in HA correctly.
 output:
   - platform: template
-    id: custom_color_r_out
+    id: color_waiting_for_command_r_out
     type: float
     write_action:
-      - lambda: id(led_ring_color_r) = state;
+      - lambda: id(color_waiting_for_command_r) = state;
   - platform: template
-    id: custom_color_g_out
+    id: color_waiting_for_command_g_out
     type: float
     write_action:
-      - lambda: id(led_ring_color_g) = state;
+      - lambda: id(color_waiting_for_command_g) = state;
   - platform: template
-    id: custom_color_b_out
+    id: color_waiting_for_command_b_out
     type: float
     write_action:
-      - lambda: id(led_ring_color_b) = state;
+      - lambda: id(color_waiting_for_command_b) = state;
+  - platform: template
+    id: color_listening_for_command_r_out
+    type: float
+    write_action:
+      - lambda: id(color_listening_for_command_r) = state;
+  - platform: template
+    id: color_listening_for_command_g_out
+    type: float
+    write_action:
+      - lambda: id(color_listening_for_command_g) = state;
+  - platform: template
+    id: color_listening_for_command_b_out
+    type: float
+    write_action:
+      - lambda: id(color_listening_for_command_b) = state;
+  - platform: template
+    id: color_thinking_r_out
+    type: float
+    write_action:
+      - lambda: id(color_thinking_r) = state;
+  - platform: template
+    id: color_thinking_g_out
+    type: float
+    write_action:
+      - lambda: id(color_thinking_g) = state;
+  - platform: template
+    id: color_thinking_b_out
+    type: float
+    write_action:
+      - lambda: id(color_thinking_b) = state;
+  - platform: template
+    id: color_replying_r_out
+    type: float
+    write_action:
+      - lambda: id(color_replying_r) = state;
+  - platform: template
+    id: color_replying_g_out
+    type: float
+    write_action:
+      - lambda: id(color_replying_g) = state;
+  - platform: template
+    id: color_replying_b_out
+    type: float
+    write_action:
+      - lambda: id(color_replying_b) = state;
+  - platform: template
+    id: color_error_r_out
+    type: float
+    write_action:
+      - lambda: id(color_error_r) = state;
+  - platform: template
+    id: color_error_g_out
+    type: float
+    write_action:
+      - lambda: id(color_error_g) = state;
+  - platform: template
+    id: color_error_b_out
+    type: float
+    write_action:
+      - lambda: id(color_error_b) = state;
+  - platform: template
+    id: color_not_ready_r_out
+    type: float
+    write_action:
+      - lambda: id(color_not_ready_r) = state;
+  - platform: template
+    id: color_not_ready_g_out
+    type: float
+    write_action:
+      - lambda: id(color_not_ready_g) = state;
+  - platform: template
+    id: color_not_ready_b_out
+    type: float
+    write_action:
+      - lambda: id(color_not_ready_b) = state;
+  - platform: template
+    id: color_muted_r_out
+    type: float
+    write_action:
+      - lambda: id(color_muted_r) = state;
+  - platform: template
+    id: color_muted_g_out
+    type: float
+    write_action:
+      - lambda: id(color_muted_g) = state;
+  - platform: template
+    id: color_muted_b_out
+    type: float
+    write_action:
+      - lambda: id(color_muted_b) = state;
+  - platform: template
+    id: color_timers_active_r_out
+    type: float
+    write_action:
+      - lambda: id(color_timers_active_r) = state;
+  - platform: template
+    id: color_timers_active_g_out
+    type: float
+    write_action:
+      - lambda: id(color_timers_active_g) = state;
+  - platform: template
+    id: color_timers_active_b_out
+    type: float
+    write_action:
+      - lambda: id(color_timers_active_b) = state;
+  - platform: template
+    id: color_ringing_r_out
+    type: float
+    write_action:
+      - lambda: id(color_ringing_r) = state;
+  - platform: template
+    id: color_ringing_g_out
+    type: float
+    write_action:
+      - lambda: id(color_ringing_g) = state;
+  - platform: template
+    id: color_ringing_b_out
+    type: float
+    write_action:
+      - lambda: id(color_ringing_b) = state;
+  - platform: template
+    id: color_playing_music_r_out
+    type: float
+    write_action:
+      - lambda: id(color_playing_music_r) = state;
+  - platform: template
+    id: color_playing_music_g_out
+    type: float
+    write_action:
+      - lambda: id(color_playing_music_g) = state;
+  - platform: template
+    id: color_playing_music_b_out
+    type: float
+    write_action:
+      - lambda: id(color_playing_music_b) = state;
 
 # ---------------------------------------------------------------------------
 # Audio path: ESP-SR front end over a 4-slot TDM capture.
@@ -943,6 +1187,132 @@ globals:
     type: float
     restore_value: no
     initial_value: '0.8'
+  # Per-stage custom color, one float per channel per stage - backing
+  # storage for the light widgets above. Plain floats, safe to restore
+  # (unlike the std::string globals earlier in this file - see the
+  # comment above saved_alarm_time/saved_time_zone for why that distinction
+  # matters). Initial values match control_leds' current hardcoded colors
+  # for each stage, so the picker starts pre-populated with what's real.
+  - id: color_waiting_for_command_r
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_waiting_for_command_g
+    type: float
+    restore_value: yes
+    initial_value: '0.110000'
+  - id: color_waiting_for_command_b
+    type: float
+    restore_value: yes
+    initial_value: '0.945000'
+  - id: color_listening_for_command_r
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_listening_for_command_g
+    type: float
+    restore_value: yes
+    initial_value: '0.110000'
+  - id: color_listening_for_command_b
+    type: float
+    restore_value: yes
+    initial_value: '0.945000'
+  - id: color_thinking_r
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_thinking_g
+    type: float
+    restore_value: yes
+    initial_value: '0.110000'
+  - id: color_thinking_b
+    type: float
+    restore_value: yes
+    initial_value: '0.945000'
+  - id: color_replying_r
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
+  - id: color_replying_g
+    type: float
+    restore_value: yes
+    initial_value: '0.350000'
+  - id: color_replying_b
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_error_r
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_error_g
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
+  - id: color_error_b
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
+  - id: color_not_ready_r
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_not_ready_g
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
+  - id: color_not_ready_b
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
+  - id: color_muted_r
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_muted_g
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
+  - id: color_muted_b
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
+  - id: color_timers_active_r
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
+  - id: color_timers_active_g
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_timers_active_b
+    type: float
+    restore_value: yes
+    initial_value: '0.200000'
+  - id: color_ringing_r
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
+  - id: color_ringing_g
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_ringing_b
+    type: float
+    restore_value: yes
+    initial_value: '0.200000'
+  - id: color_playing_music_r
+    type: float
+    restore_value: yes
+    initial_value: '0.062745'
+  - id: color_playing_music_g
+    type: float
+    restore_value: yes
+    initial_value: '1.000000'
+  - id: color_playing_music_b
+    type: float
+    restore_value: yes
+    initial_value: '0.000000'
   # Which TDM slot the audio stack is currently using as the AEC reference, so
   # debug_ref_slot can skip the bus restart when the value has not actually
   # changed. Must match tdm_ref_slot in the esp_audio_stack block.
@@ -1450,112 +1820,6 @@ select:
       - "Send event"
       - "Sound and event"
     initial_option: "Play sound"
-
-  # Per-stage LED ring effects. These persist a per-stage choice (via each
-  # select's own restore_value, index-based and safe) but nothing reads them
-  # yet - control_leds still hardcodes its effects, same as before this
-  # existed. Wiring these back in is follow-up work. Options deliberately
-  # exclude "off": an "off" indicator for e.g. Listening would read as the
-  # device having gone unresponsive rather than as a choice.
-  - platform: template
-    name: "LED Effect: Waiting for command"
-    id: select_effect_waiting_for_command
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: solid
-    options: &led_effect_options
-      - solid
-      - Pulse Slow
-      - Pulse Medium
-      - Pulse Fast
-      - Rainbow Slow
-      - Wipe
-      - Comet
-      - Sound Reactive
-      - Mic Reactive
-  - platform: template
-    name: "LED Effect: Listening"
-    id: select_effect_listening_for_command
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: Pulse Fast
-    options: *led_effect_options
-  - platform: template
-    name: "LED Effect: Thinking"
-    id: select_effect_thinking
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: Comet
-    options: *led_effect_options
-  - platform: template
-    name: "LED Effect: Replying"
-    id: select_effect_replying
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: Pulse Slow
-    options: *led_effect_options
-  - platform: template
-    name: "LED Effect: Error"
-    id: select_effect_error
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: Pulse Fast
-    options: *led_effect_options
-  - platform: template
-    name: "LED Effect: Not ready"
-    id: select_effect_not_ready
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: Pulse Slow
-    options: *led_effect_options
-  - platform: template
-    name: "LED Effect: Muted"
-    id: select_effect_muted
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: solid
-    options: *led_effect_options
-  - platform: template
-    name: "LED Effect: Timer active"
-    id: select_effect_timers_active
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: Pulse Slow
-    options: *led_effect_options
-  - platform: template
-    name: "LED Effect: Timer ringing"
-    id: select_effect_ringing
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: Pulse Fast
-    options: *led_effect_options
-  - platform: template
-    name: "LED Effect: Playing music"
-    id: select_effect_playing_music
-    icon: mdi:led-strip-variant
-    entity_category: config
-    optimistic: true
-    restore_value: true
-    initial_option: Pulse Slow
-    options: *led_effect_options
 
 switch:
   - platform: template
