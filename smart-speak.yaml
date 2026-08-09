@@ -307,12 +307,12 @@ light:
                             (uint8_t) (current_color.blue * level));
             }
             head = (head + 1) % n;
-      # A VU-style bar that grows around the ring with how loud the speaker is
-      # playing. Reads TDM slot 1, the AEC reference tap wired to the ES8311's
-      # output (see the esp_audio_stack block below) - an electrical copy of
-      # what is being played, not a microphone, so it is unaffected by room
-      # acoustics or how loud the mics happen to be. -60/-19 dBFS are this
-      # board's measured idle/playing figures for that slot, same numbers the
+      # Whole-ring brightness pulsing with how loud the speaker is playing.
+      # Reads TDM slot 1, the AEC reference tap wired to the ES8311's output
+      # (see the esp_audio_stack block below) - an electrical copy of what is
+      # being played, not a microphone, so it is unaffected by room acoustics
+      # or how loud the mics happen to be. -60/-19 dBFS are this board's
+      # measured idle/playing figures for that slot, same numbers the
       # tdm_slot_levels sensors below are commented against.
       #
       # get_tdm_slot_level_dbfs() is a lock-free atomic read updated by the
@@ -330,13 +330,9 @@ light:
             if (target < 0.0f) target = 0.0f;
             if (target > 1.0f) target = 1.0f;
             level += (target - level) * 0.3f;  // one-pole smoothing so it doesn't strobe frame to frame
+            const float b = 0.05f + level * 0.95f;  // 0.05 floor so the ring outline stays visible when quiet
             const int n = it.size();
-            const float lit = level * n;
             for (int i = 0; i < n; i++) {
-              float b;
-              if (i < (int) lit) b = 1.0f;
-              else if (i == (int) lit) b = lit - (int) lit;  // partial pixel at the boundary
-              else b = 0.05f;  // faint so the ring outline stays visible when quiet
               it[i] = Color((uint8_t) (current_color.red * b),
                             (uint8_t) (current_color.green * b),
                             (uint8_t) (current_color.blue * b));
@@ -369,6 +365,45 @@ light:
                             (uint8_t) (current_color.green * b),
                             (uint8_t) (current_color.blue * b));
             }
+
+  # Software-only RGB light: HA renders a real color wheel for it, same as
+  # it would for Status Ring above, because color_mode is a property of any
+  # `light` entity, not something specific to a physical LED strip. Backed
+  # by the three template outputs below rather than real hardware - picking
+  # a color here doesn't touch the ring yet. See the "output:" comment below
+  # for why this needs template outputs instead of a template light platform.
+  - platform: rgb
+    id: custom_ring_color
+    name: "LED Custom Color"
+    icon: mdi:palette
+    entity_category: config
+    red: custom_color_r_out
+    green: custom_color_g_out
+    blue: custom_color_b_out
+
+# Backing outputs for the "LED Custom Color" picker below. There's no
+# `light: platform: template` in ESPHome (unlike select/number/switch, which
+# do have a template platform) - the documented way to get a software-only
+# RGB light is three float outputs feeding `light: platform: rgb`. Each
+# output's write_action just stashes the value in the same globals
+# set_led_color already writes to; nothing reads them for real yet - that's
+# the next step, once this is confirmed showing up in HA.
+output:
+  - platform: template
+    id: custom_color_r_out
+    type: float
+    write_action:
+      - lambda: id(led_ring_color_r) = state;
+  - platform: template
+    id: custom_color_g_out
+    type: float
+    write_action:
+      - lambda: id(led_ring_color_g) = state;
+  - platform: template
+    id: custom_color_b_out
+    type: float
+    write_action:
+      - lambda: id(led_ring_color_b) = state;
 
 # ---------------------------------------------------------------------------
 # Audio path: ESP-SR front end over a 4-slot TDM capture.
@@ -1132,13 +1167,11 @@ script:
             return;
           }
 
-          // Lowest-priority resting state: teal, so it reads apart from the
-          // purple/blue voice phases, the red error/muted states and the
-          // green timer states. Anything above still outranks it, same as it
-          // outranks plain "off" - a kitchen timer or a mute should still be
-          // visible over quiet background music.
+          // Lowest-priority resting state. Anything above still outranks it,
+          // same as it outranks plain "off" - a kitchen timer or a mute
+          // should still be visible over quiet background music.
           if (playing_music) {
-            set("Pulse Slow", 0.0, 0.8, 0.8);
+            set("Pulse Slow", 16.0 / 255.0, 1.0, 0.0);
             return;
           }
 
