@@ -912,49 +912,50 @@ globals:
     type: float
     restore_value: no
     initial_value: '0.8'
-  # Per-stage LED effect, editable from HA (select entities below) and
-  # persisted like saved_alarm_action is - restore_value on both the select
-  # and its backing global. Colour stays hardcoded in control_leds; only the
-  # effect (Pulse Fast, Comet, solid, ...) is configurable per stage.
+  # Per-stage LED effect, editable from HA (select entities below). Colour
+  # stays hardcoded in control_leds; only the effect (Pulse Fast, Comet,
+  # solid, ...) is configurable per stage.
+  # restore_value stays off here: ESPHome's globals restore does a raw
+  # sizeof(T) byte copy out of flash, which is only safe for POD types.
+  # For std::string it clobbers the object with whatever bytes happen to be
+  # in that preference slot - garbage for a slot that never held a string,
+  # or a stale heap pointer from a previous boot for one that did - and
+  # either way it corrupts the heap the first time something touches the
+  # string (crashed with a LoadProhibited fault inside an unrelated
+  # LightState/AddressableLightEffect the first time this was tried).
+  # Persistence for these already lives on the select entities below
+  # (restore_value: true there is index-based, not a raw string copy), and
+  # each one republishes on boot, which re-runs its on_value and repopulates
+  # the global - so nothing is lost by not restoring the global directly.
   - id: effect_waiting_for_command
     type: std::string
-    restore_value: yes
     initial_value: '"solid"'
   - id: effect_listening_for_command
     type: std::string
-    restore_value: yes
     initial_value: '"Pulse Fast"'
   - id: effect_thinking
     type: std::string
-    restore_value: yes
     initial_value: '"Comet"'
   - id: effect_replying
     type: std::string
-    restore_value: yes
     initial_value: '"Pulse Slow"'
   - id: effect_error
     type: std::string
-    restore_value: yes
     initial_value: '"Pulse Fast"'
   - id: effect_not_ready
     type: std::string
-    restore_value: yes
     initial_value: '"Pulse Slow"'
   - id: effect_muted
     type: std::string
-    restore_value: yes
     initial_value: '"solid"'
   - id: effect_timers_active
     type: std::string
-    restore_value: yes
     initial_value: '"Pulse Slow"'
   - id: effect_ringing
     type: std::string
-    restore_value: yes
     initial_value: '"Pulse Fast"'
   - id: effect_playing_music
     type: std::string
-    restore_value: yes
     initial_value: '"Pulse Slow"'
   # Which TDM slot the audio stack is currently using as the AEC reference, so
   # debug_ref_slot can skip the bus restart when the value has not actually
@@ -1460,9 +1461,11 @@ select:
 
   # Per-stage LED ring effects. Colour per stage is fixed in control_leds -
   # see the comment there - but which animation plays is user-configurable
-  # and persisted, same restore_value pattern as Alarm action above. Options
-  # deliberately exclude "off": an "off" indicator for e.g. Listening would
-  # read as the device having gone unresponsive rather than as a choice.
+  # and persisted via each select's own restore_value (index-based, unlike
+  # the raw-string global restore that used to back this - see the globals
+  # block comment above). Options deliberately exclude "off": an "off"
+  # indicator for e.g. Listening would read as the device having gone
+  # unresponsive rather than as a choice.
   - platform: template
     name: "LED Effect: Waiting for command"
     id: select_effect_waiting_for_command
