@@ -117,14 +117,14 @@ esphome:
                 lt->turn_off().perform();
               };
               seed(id(light_starting_up), 0.9f, 0.1f, 0.85f, 1.0f);
-              seed(id(light_idle), 1.0f, 1.0f, 1.0f, 0.0f);
+              seed(id(light_idle), 1.0f, 1.0f, 1.0f, 0.01f);
               seed(id(light_waiting_for_command), 1.0f, 0.11f, 0.945f, 1.0f);
               seed(id(light_listening_for_command), 1.0f, 0.11f, 0.945f, 1.0f);
               seed(id(light_thinking), 1.0f, 0.11f, 0.945f, 1.0f);
               seed(id(light_replying), 0.0f, 0.35f, 1.0f, 1.0f);
               seed(id(light_error), 1.0f, 0.0f, 0.0f, 1.0f);
               seed(id(light_not_ready), 1.0f, 0.0f, 0.0f, 1.0f);
-              seed(id(light_muted), 1.0f, 0.0f, 0.0f, 0.12f);
+              seed(id(light_muted), 1.0f, 0.0f, 0.0f, 0.15f);
               seed(id(light_timers_active), 0.0f, 1.0f, 0.2f, 1.0f);
               seed(id(light_ringing), 0.0f, 1.0f, 0.2f, 1.0f);
               seed(id(light_playing_music), 16.0f / 255.0f, 1.0f, 0.0f, 1.0f);
@@ -462,10 +462,10 @@ light:
   # effect can't be the source of truth: ESPHome clears a light's effect the
   # moment it turns off. Each on_state instead mirrors an effect index that
   # persists in the effect_* globals (see globals: below) - seeded with the
-  # defaults, updated whenever the widget is on with a real effect selected,
-  # and re-applied by control_leds on activation - and Status Ring's own
-  # effects: list (above) declares the same eight names in the same order,
-  # so the index maps straight across.
+  # defaults, updated from the widget's on_state whenever it is on (including
+  # a deliberate None), and re-applied by control_leds on activation - and
+  # Status Ring's own effects: list (above) declares the same eight names in
+  # the same order, so the index maps straight across.
   - platform: rgb
     id: light_starting_up
     name: "LED: Starting up"
@@ -549,10 +549,20 @@ light:
                              id(light_starting_up).remote_values.get_blue());
                 call.set_brightness(id(light_starting_up).remote_values.get_brightness());
                 auto idx = id(light_starting_up).get_current_effect_index();
-                if (idx != 0) id(effect_starting_up) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_starting_up));
+                if (idx != 0 || id(last_on_effect_starting_up) != 0) {
+                  id(effect_starting_up) = idx;
+                  id(last_on_effect_starting_up) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_starting_up));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_starting_up) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -578,7 +588,7 @@ light:
                   - script.execute: control_leds
   # Resting state: nothing else applies - connected, unmuted, no timer, no
   # voice phase, no music. Used to be a hardcoded turn_off; now a real
-  # preset like the others, defaulting to the same "off" look (0 brightness)
+  # preset like the others, defaulting to the same "off" look (1% brightness)
   # so behavior is unchanged until you deliberately brighten it.
   - platform: rgb
     id: light_idle
@@ -614,10 +624,20 @@ light:
                              id(light_idle).remote_values.get_blue());
                 call.set_brightness(id(light_idle).remote_values.get_brightness());
                 auto idx = id(light_idle).get_current_effect_index();
-                if (idx != 0) id(effect_idle) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_idle));
+                if (idx != 0 || id(last_on_effect_idle) != 0) {
+                  id(effect_idle) = idx;
+                  id(last_on_effect_idle) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_idle));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_idle) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -675,10 +695,20 @@ light:
                              id(light_waiting_for_command).remote_values.get_blue());
                 call.set_brightness(id(light_waiting_for_command).remote_values.get_brightness());
                 auto idx = id(light_waiting_for_command).get_current_effect_index();
-                if (idx != 0) id(effect_waiting_for_command) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_waiting_for_command));
+                if (idx != 0 || id(last_on_effect_waiting_for_command) != 0) {
+                  id(effect_waiting_for_command) = idx;
+                  id(last_on_effect_waiting_for_command) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_waiting_for_command));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_waiting_for_command) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -736,10 +766,20 @@ light:
                              id(light_listening_for_command).remote_values.get_blue());
                 call.set_brightness(id(light_listening_for_command).remote_values.get_brightness());
                 auto idx = id(light_listening_for_command).get_current_effect_index();
-                if (idx != 0) id(effect_listening_for_command) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_listening_for_command));
+                if (idx != 0 || id(last_on_effect_listening_for_command) != 0) {
+                  id(effect_listening_for_command) = idx;
+                  id(last_on_effect_listening_for_command) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_listening_for_command));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_listening_for_command) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -797,10 +837,20 @@ light:
                              id(light_thinking).remote_values.get_blue());
                 call.set_brightness(id(light_thinking).remote_values.get_brightness());
                 auto idx = id(light_thinking).get_current_effect_index();
-                if (idx != 0) id(effect_thinking) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_thinking));
+                if (idx != 0 || id(last_on_effect_thinking) != 0) {
+                  id(effect_thinking) = idx;
+                  id(last_on_effect_thinking) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_thinking));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_thinking) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -858,10 +908,20 @@ light:
                              id(light_replying).remote_values.get_blue());
                 call.set_brightness(id(light_replying).remote_values.get_brightness());
                 auto idx = id(light_replying).get_current_effect_index();
-                if (idx != 0) id(effect_replying) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_replying));
+                if (idx != 0 || id(last_on_effect_replying) != 0) {
+                  id(effect_replying) = idx;
+                  id(last_on_effect_replying) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_replying));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_replying) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -919,10 +979,20 @@ light:
                              id(light_error).remote_values.get_blue());
                 call.set_brightness(id(light_error).remote_values.get_brightness());
                 auto idx = id(light_error).get_current_effect_index();
-                if (idx != 0) id(effect_error) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_error));
+                if (idx != 0 || id(last_on_effect_error) != 0) {
+                  id(effect_error) = idx;
+                  id(last_on_effect_error) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_error));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_error) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -980,10 +1050,20 @@ light:
                              id(light_not_ready).remote_values.get_blue());
                 call.set_brightness(id(light_not_ready).remote_values.get_brightness());
                 auto idx = id(light_not_ready).get_current_effect_index();
-                if (idx != 0) id(effect_not_ready) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_not_ready));
+                if (idx != 0 || id(last_on_effect_not_ready) != 0) {
+                  id(effect_not_ready) = idx;
+                  id(last_on_effect_not_ready) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_not_ready));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_not_ready) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -1041,10 +1121,20 @@ light:
                              id(light_muted).remote_values.get_blue());
                 call.set_brightness(id(light_muted).remote_values.get_brightness());
                 auto idx = id(light_muted).get_current_effect_index();
-                if (idx != 0) id(effect_muted) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_muted));
+                if (idx != 0 || id(last_on_effect_muted) != 0) {
+                  id(effect_muted) = idx;
+                  id(last_on_effect_muted) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_muted));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_muted) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -1102,10 +1192,20 @@ light:
                              id(light_timers_active).remote_values.get_blue());
                 call.set_brightness(id(light_timers_active).remote_values.get_brightness());
                 auto idx = id(light_timers_active).get_current_effect_index();
-                if (idx != 0) id(effect_timers_active) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_timers_active));
+                if (idx != 0 || id(last_on_effect_timers_active) != 0) {
+                  id(effect_timers_active) = idx;
+                  id(last_on_effect_timers_active) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_timers_active));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_timers_active) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -1163,10 +1263,20 @@ light:
                              id(light_ringing).remote_values.get_blue());
                 call.set_brightness(id(light_ringing).remote_values.get_brightness());
                 auto idx = id(light_ringing).get_current_effect_index();
-                if (idx != 0) id(effect_ringing) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_ringing));
+                if (idx != 0 || id(last_on_effect_ringing) != 0) {
+                  id(effect_ringing) = idx;
+                  id(last_on_effect_ringing) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_ringing));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_ringing) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -1224,10 +1334,20 @@ light:
                              id(light_playing_music).remote_values.get_blue());
                 call.set_brightness(id(light_playing_music).remote_values.get_brightness());
                 auto idx = id(light_playing_music).get_current_effect_index();
-                if (idx != 0) id(effect_playing_music) = idx;
-                call.set_effect(idx != 0 ? idx : (uint32_t) id(effect_playing_music));
+                if (idx != 0 || id(last_on_effect_playing_music) != 0) {
+                  id(effect_playing_music) = idx;
+                  id(last_on_effect_playing_music) = idx;
+                  call.set_effect(idx);
+                } else {
+                  call.set_effect((uint32_t) id(effect_playing_music));
+                }
                 call.perform();
           else:
+            # A 0 here just means the widget was off (ESPHome clears a light's
+            # effect the moment it turns off), so its fresh-turn-on tracker
+            # resets too - otherwise the next plain turn-on would read as a
+            # deliberate "None" and wipe the persisted choice.
+            - lambda: id(last_on_effect_playing_music) = 0;
             # Fallback only when nothing else is taking over: if another
             # widget just came on (this turn-off was the exclusion doing its
             # job), re-running control_leds would fight the manual selection
@@ -1952,9 +2072,9 @@ globals:
   # effect the moment the light turns off, so the widget never keeps one.
   # These globals are what actually remember the choice - seeded with the
   # defaults below, updated from each widget's on_state whenever it is on
-  # with a real effect selected, and re-applied by control_leds when the
-  # stage activates. int (unlike std::string) is POD-safe to restore, see the
-  # saved_alarm_time comment above.
+  # with an effect selected (None included), and re-applied by control_leds
+  # when the stage activates. int (unlike std::string) is POD-safe to
+  # restore, see the saved_alarm_time comment above.
   - id: effect_starting_up
     type: int
     restore_value: yes
@@ -2003,6 +2123,62 @@ globals:
     type: int
     restore_value: yes
     initial_value: '1'
+  # Transient per-widget fresh-turn-on tracker: the effect this widget was
+  # running at its most recent on_state while on, cleared to 0 whenever the
+  # widget turns off. Lets on_state tell a deliberate "None" selection (the
+  # widget was already on with an effect, which just got cleared to 0) apart
+  # from a plain turn-on (the widget was off, so its effect is 0 for free -
+  # ESPHome always clears a light's effect on turn-off). Deliberate is
+  # persisted into effect_*; a plain turn-on keeps the persisted choice.
+  # restore_value stays off: this is pure runtime state, not a setting.
+  - id: last_on_effect_starting_up
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_idle
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_waiting_for_command
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_listening_for_command
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_thinking
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_replying
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_error
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_not_ready
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_muted
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_timers_active
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_ringing
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_on_effect_playing_music
+    type: int
+    restore_value: no
+    initial_value: '0'
   # Which TDM slot the audio stack is currently using as the AEC reference, so
   # debug_ref_slot can skip the bus restart when the value has not actually
   # changed. Must match tdm_ref_slot in the esp_audio_stack block.
@@ -2247,11 +2423,10 @@ script:
             return;
           }
 
-          // Idle is the "off" look (defaults to 0 brightness). A state-only
-          // turn_on here would force that 0 back to 1.0 (ESPHome brightens a
-          // light that's on-but-invisible on turn-on), so pass the widget's
-          // current brightness explicitly - 0 by default, whatever the user
-          // brightened it to if they customized Idle.
+          // Idle is the "off" look (defaults to 1% brightness - effectively
+          // dark, but not 0, so a bare turn_on can't be auto-brightened back
+          // to full). Pass the widget's current brightness explicitly anyway,
+          // so whatever the user brightened it to when customizing Idle wins.
           auto call = id(light_idle).turn_on();
           call.set_brightness(id(light_idle).remote_values.get_brightness());
           call.set_effect((uint32_t) id(effect_idle));
