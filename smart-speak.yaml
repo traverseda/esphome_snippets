@@ -97,7 +97,7 @@ esphome:
         - lambda: |-
             id(alarm_time).publish_state(id(saved_alarm_time));
         - lambda: |-
-            setenv("TZ", id(saved_time_zone), 1);
+            setenv("TZ", id(saved_time_zone).c_str(), 1);
             tzset();
         # Seed the system clock from the onboard RTC before HA is reachable, so
         # the alarm survives an HA restart. Runs after the TZ restore above so
@@ -196,8 +196,7 @@ api:
               isdigit(alarm_time_hh_mm[0]) && isdigit(alarm_time_hh_mm[1]) &&
               isdigit(alarm_time_hh_mm[3]) && isdigit(alarm_time_hh_mm[4])) {
                 id(alarm_time).publish_state(alarm_time_hh_mm);
-                strncpy(id(saved_alarm_time), alarm_time_hh_mm.c_str(), sizeof(id(saved_alarm_time)) - 1);
-                id(saved_alarm_time)[sizeof(id(saved_alarm_time)) - 1] = '\0';
+                id(saved_alarm_time) = alarm_time_hh_mm;
               }
     - action: set_time_zone
       variables:
@@ -206,8 +205,7 @@ api:
         - lambda: |-
             setenv("TZ", posix_time_zone.c_str(), 1);
             tzset();
-            strncpy(id(saved_time_zone), posix_time_zone.c_str(), sizeof(id(saved_time_zone)) - 1);
-            id(saved_time_zone)[sizeof(id(saved_time_zone)) - 1] = '\0';
+            id(saved_time_zone) = posix_time_zone;
             id(publish_current_time).execute();
   on_client_connected:
     - script.execute: control_leds
@@ -910,51 +908,6 @@ globals:
     type: float
     restore_value: no
     initial_value: '0.8'
-  # Per-stage LED effect, editable from HA (select entities below). Colour
-  # stays hardcoded in control_leds; only the effect (Pulse Fast, Comet,
-  # solid, ...) is configurable per stage.
-  # restore_value stays off here: ESPHome's globals restore does a raw
-  # sizeof(T) byte copy out of flash, which is only safe for POD types.
-  # For std::string it clobbers the object with whatever bytes happen to be
-  # in that preference slot - garbage for a slot that never held a string,
-  # or a stale heap pointer from a previous boot for one that did - and
-  # either way it corrupts the heap the first time something touches the
-  # string (crashed with a LoadProhibited fault inside an unrelated
-  # LightState/AddressableLightEffect the first time this was tried).
-  # Persistence for these already lives on the select entities below
-  # (restore_value: true there is index-based, not a raw string copy), and
-  # each one republishes on boot, which re-runs its on_value and repopulates
-  # the global - so nothing is lost by not restoring the global directly.
-  - id: effect_waiting_for_command
-    type: std::string
-    initial_value: '"solid"'
-  - id: effect_listening_for_command
-    type: std::string
-    initial_value: '"Pulse Fast"'
-  - id: effect_thinking
-    type: std::string
-    initial_value: '"Comet"'
-  - id: effect_replying
-    type: std::string
-    initial_value: '"Pulse Slow"'
-  - id: effect_error
-    type: std::string
-    initial_value: '"Pulse Fast"'
-  - id: effect_not_ready
-    type: std::string
-    initial_value: '"Pulse Slow"'
-  - id: effect_muted
-    type: std::string
-    initial_value: '"solid"'
-  - id: effect_timers_active
-    type: std::string
-    initial_value: '"Pulse Slow"'
-  - id: effect_ringing
-    type: std::string
-    initial_value: '"Pulse Fast"'
-  - id: effect_playing_music
-    type: std::string
-    initial_value: '"Pulse Slow"'
   # Which TDM slot the audio stack is currently using as the AEC reference, so
   # debug_ref_slot can skip the bus restart when the value has not actually
   # changed. Must match tdm_ref_slot in the esp_audio_stack block.
@@ -974,22 +927,25 @@ globals:
     type: int
     restore_value: no
     initial_value: ${voice_assist_not_ready_phase_id}
-  # char arrays, not std::string: these two are the ones the effect-select
-  # globals above turned out not to be the whole story on. They predate this
-  # file's first commit and still had restore_value: yes on a std::string,
-  # the same raw sizeof(T) flash copy that corrupted the heap up there - a
-  # std::string's short-string-optimization buffer holds a self-pointer into
-  # the object's own memory, so even a 5-character "HH:MM" is unsafe to
-  # restore by byte copy; the pointer comes back aimed at wherever the
-  # object used to live, not wherever it lives now. A fixed char array has
-  # no pointers in its representation, so the same byte copy is safe.
+  # restore_value stays off: ESPHome's globals restore does a raw sizeof(T)
+  # byte copy out of flash, which is only safe for POD types. A std::string's
+  # short-string-optimization buffer holds a pointer into the object's own
+  # memory even for a 5-character "HH:MM", so restoring it by byte copy aims
+  # that pointer at wherever the object used to live, not wherever it lives
+  # now - heap corruption (crashed with LoadProhibited inside an unrelated
+  # LightState/AddressableLightEffect the first time this was tried). A
+  # char[N] array would be the POD-safe fix, but ESPHome's
+  # RestoringGlobalsComponent takes its initial value by-value and a C array
+  # parameter decays to a pointer, so `type: char[N]` does not compile
+  # ("invalid conversion from char* to char"). Not worth chasing a
+  # std::array<char, N> workaround for two rarely-changed settings - dropping
+  # restore_value means alarm time and time zone reset to these defaults on
+  # every reboot instead of persisting, which is the accepted trade here.
   - id: saved_alarm_time
-    type: char[16]
-    restore_value: yes
+    type: std::string
     initial_value: '"Unknown"'
   - id: saved_time_zone
-    type: char[48]
-    restore_value: yes
+    type: std::string
     initial_value: '"UTC0"'
   - id: first_active_timer
     type: voice_assistant::Timer
@@ -1121,7 +1077,7 @@ script:
             return;
           }
           if (ringing) {
-            set(id(effect_ringing).c_str(), 0.0, 1.0, 0.2);
+            set("Pulse Fast", 0.0, 1.0, 0.2);
             return;
           }
 
@@ -1134,26 +1090,29 @@ script:
           // derived. The previous 0.55/0.0/1.0 read as blue, because a WS2812's
           // blue die is far brighter than its red at equal PWM. All three
           // phases share the one hue; the effect is what tells them apart.
-          // Effects are configurable per stage (see the select: entities
-          // below) - only the colour stays fixed here.
+          //
+          // The "LED Effect: ..." select entities below let you see and
+          // persist a choice per stage, but nothing here reads them yet -
+          // wiring them back in is follow-up work. Effects are hardcoded for
+          // now, same as before that feature was added.
           switch (phase) {
             case ${voice_assist_waiting_for_command_phase_id}:
-              set(id(effect_waiting_for_command).c_str(), 1.0, 0.11, 0.945);    // awake, waiting for you
+              set("solid", 1.0, 0.11, 0.945);         // awake, waiting for you
               return;
             case ${voice_assist_listening_for_command_phase_id}:
-              set(id(effect_listening_for_command).c_str(), 1.0, 0.11, 0.945); // hearing you speak
+              set("Pulse Fast", 1.0, 0.11, 0.945);    // hearing you speak
               return;
             case ${voice_assist_thinking_phase_id}:
-              set(id(effect_thinking).c_str(), 1.0, 0.11, 0.945);              // spinning = working
+              set("Comet", 1.0, 0.11, 0.945);         // spinning = working
               return;
             case ${voice_assist_replying_phase_id}:
-              set(id(effect_replying).c_str(), 0.0, 0.35, 1.0);                // its turn to talk
+              set("Pulse Slow", 0.0, 0.35, 1.0);      // its turn to talk
               return;
             case ${voice_assist_error_phase_id}:
-              set(id(effect_error).c_str(), 1.0, 0.0, 0.0);
+              set("Pulse Fast", 1.0, 0.0, 0.0);
               return;
             case ${voice_assist_not_ready_phase_id}:
-              set(id(effect_not_ready).c_str(), 1.0, 0.0, 0.0);
+              set("Pulse Slow", 1.0, 0.0, 0.0);
               return;
             default: break;
           }
@@ -1164,12 +1123,12 @@ script:
           // with nothing on the ring to explain it. It stays below ringing and
           // below every voice phase, which are all momentary.
           if (muted) {
-            set_dim(id(effect_muted).c_str(), 1.0, 0.0, 0.0, 0.12);
+            set_dim("solid", 1.0, 0.0, 0.0, 0.12);
             return;
           }
 
           if (timers_active) {
-            set(id(effect_timers_active).c_str(), 0.0, 1.0, 0.2);
+            set("Pulse Slow", 0.0, 1.0, 0.2);
             return;
           }
 
@@ -1179,7 +1138,7 @@ script:
           // outranks plain "off" - a kitchen timer or a mute should still be
           // visible over quiet background music.
           if (playing_music) {
-            set(id(effect_playing_music).c_str(), 0.0, 0.8, 0.8);
+            set("Pulse Slow", 0.0, 0.8, 0.8);
             return;
           }
 
@@ -1459,13 +1418,12 @@ select:
       - "Sound and event"
     initial_option: "Play sound"
 
-  # Per-stage LED ring effects. Colour per stage is fixed in control_leds -
-  # see the comment there - but which animation plays is user-configurable
-  # and persisted via each select's own restore_value (index-based, unlike
-  # the raw-string global restore that used to back this - see the globals
-  # block comment above). Options deliberately exclude "off": an "off"
-  # indicator for e.g. Listening would read as the device having gone
-  # unresponsive rather than as a choice.
+  # Per-stage LED ring effects. These persist a per-stage choice (via each
+  # select's own restore_value, index-based and safe) but nothing reads them
+  # yet - control_leds still hardcodes its effects, same as before this
+  # existed. Wiring these back in is follow-up work. Options deliberately
+  # exclude "off": an "off" indicator for e.g. Listening would read as the
+  # device having gone unresponsive rather than as a choice.
   - platform: template
     name: "LED Effect: Waiting for command"
     id: select_effect_waiting_for_command
@@ -1484,10 +1442,6 @@ select:
       - Comet
       - Sound Reactive
       - Mic Reactive
-    on_value:
-      then:
-        - lambda: id(effect_waiting_for_command) = x;
-        - script.execute: control_leds
   - platform: template
     name: "LED Effect: Listening"
     id: select_effect_listening_for_command
@@ -1497,10 +1451,6 @@ select:
     restore_value: true
     initial_option: Pulse Fast
     options: *led_effect_options
-    on_value:
-      then:
-        - lambda: id(effect_listening_for_command) = x;
-        - script.execute: control_leds
   - platform: template
     name: "LED Effect: Thinking"
     id: select_effect_thinking
@@ -1510,10 +1460,6 @@ select:
     restore_value: true
     initial_option: Comet
     options: *led_effect_options
-    on_value:
-      then:
-        - lambda: id(effect_thinking) = x;
-        - script.execute: control_leds
   - platform: template
     name: "LED Effect: Replying"
     id: select_effect_replying
@@ -1523,10 +1469,6 @@ select:
     restore_value: true
     initial_option: Pulse Slow
     options: *led_effect_options
-    on_value:
-      then:
-        - lambda: id(effect_replying) = x;
-        - script.execute: control_leds
   - platform: template
     name: "LED Effect: Error"
     id: select_effect_error
@@ -1536,10 +1478,6 @@ select:
     restore_value: true
     initial_option: Pulse Fast
     options: *led_effect_options
-    on_value:
-      then:
-        - lambda: id(effect_error) = x;
-        - script.execute: control_leds
   - platform: template
     name: "LED Effect: Not ready"
     id: select_effect_not_ready
@@ -1549,10 +1487,6 @@ select:
     restore_value: true
     initial_option: Pulse Slow
     options: *led_effect_options
-    on_value:
-      then:
-        - lambda: id(effect_not_ready) = x;
-        - script.execute: control_leds
   - platform: template
     name: "LED Effect: Muted"
     id: select_effect_muted
@@ -1562,10 +1496,6 @@ select:
     restore_value: true
     initial_option: solid
     options: *led_effect_options
-    on_value:
-      then:
-        - lambda: id(effect_muted) = x;
-        - script.execute: control_leds
   - platform: template
     name: "LED Effect: Timer active"
     id: select_effect_timers_active
@@ -1575,10 +1505,6 @@ select:
     restore_value: true
     initial_option: Pulse Slow
     options: *led_effect_options
-    on_value:
-      then:
-        - lambda: id(effect_timers_active) = x;
-        - script.execute: control_leds
   - platform: template
     name: "LED Effect: Timer ringing"
     id: select_effect_ringing
@@ -1588,10 +1514,6 @@ select:
     restore_value: true
     initial_option: Pulse Fast
     options: *led_effect_options
-    on_value:
-      then:
-        - lambda: id(effect_ringing) = x;
-        - script.execute: control_leds
   - platform: template
     name: "LED Effect: Playing music"
     id: select_effect_playing_music
@@ -1601,10 +1523,6 @@ select:
     restore_value: true
     initial_option: Pulse Slow
     options: *led_effect_options
-    on_value:
-      then:
-        - lambda: id(effect_playing_music) = x;
-        - script.execute: control_leds
 
 switch:
   - platform: template
