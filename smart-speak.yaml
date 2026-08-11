@@ -1811,18 +1811,35 @@ media_player:
   # Internal and pinned to 1.0 for the same reason as external_media_player:
   # this player's set_volume() would otherwise land on the stack's single shared
   # output gain and pull voice with it - which is the exact bug this section
-  # exists to avoid. Sendspin loudness lives in the "Sendspin Volume" number
-  # (mixer ducking on sendspin_mixing_input) instead.
+  # exists to avoid. Sendspin loudness is applied per-stream as mixer ducking on
+  # sendspin_mixing_input instead.
+  #
+  # Music Assistant / the sendspin server are still allowed to drive volume: the
+  # sendspin media source's on_volume_changed -> request_volume path lands in
+  # this player's on_volume trigger with the raw value (x, 0..1) even though the
+  # entity volume itself is pinned. That is converted to ducking here, and the
+  # "Sendspin Volume" knob mirrors the same value so the resting level that
+  # apply_volume_ducking reads during announcements stays in sync.
   - platform: speaker_source
     id: sendspin_media_player
     name: "Sendspin"
     internal: True
     volume_min: 1.0
     volume_max: 1.0
+    volume_initial: 1.0
     media_pipeline:
       speaker: sendspin_resampling_speaker
       sources:
         - sendspin_media_source
+    on_volume:
+      - lambda: |-
+          float db = 49.0f * (1.0f - x);
+          if (db < 0.0f) db = 0.0f;
+          if (db > 50.0f) db = 50.0f;
+          id(sendspin_mixing_input)->apply_ducking((uint8_t) db, 0);
+          if (std::abs(id(sendspin_volume).state - x * 100.0f) >= 1.0f) {
+            id(sendspin_volume).publish_state(x * 100.0f);
+          }
     on_state:
       - script.execute: control_leds
 
@@ -3106,20 +3123,23 @@ number:
     step: 1
     mode: slider
     on_value:
+      # Mirror the knob onto the sendspin media player. That flows back through
+      # on_volume - which applies the mixer ducking and re-publishes the knob
+      # (a no-op here) - and pushes the new level to the sendspin server so
+      # Music Assistant's slider stays in sync. The player is volume-pinned, so
+      # this never touches the shared output gain. Skipped when the values
+      # already agree (the media player is the persisted source of truth).
+      - lambda: |-
+          float target = id(sendspin_volume).state / 100.0f;
+          if (std::abs(id(sendspin_media_player).volume - target) >= 0.001f) {
+            id(sendspin_media_player)->make_call().set_volume(target).perform();
+          }
       - if:
           condition:
-            and:
-              - not:
-                  voice_assistant.is_running:
-              - not:
-                  media_player.is_announcing:
-                    id: external_media_player
-              - switch.is_off: timer_ringing
+            - lambda: return !id(init_in_progress);
           then:
-            - script.execute:
-                id: apply_volume_ducking
-                base_extra_db: 0
-                duration_ms: 0
+            - delay: 100ms # Debounce
+            - script.execute: control_leds_volume_changed
 
 sensor:
   - platform: template
