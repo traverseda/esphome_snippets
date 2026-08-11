@@ -1684,19 +1684,32 @@ speaker:
     sample_rate: 16000
     bits_per_sample: 16
 
-  # Virtual speakers to combine the announcement and media streams together into one output
+  # Virtual speakers to combine the announcement and sendspin streams into one
+  # output. There is no media input any more: music only ever arrives through
+  # the sendspin stream, so the local media pipeline that used to feed this
+  # mixer (and the media_mixing_input/media_resampling_speaker it owned) is gone.
   #
   # Mono, not stereo: a TDM bus places playback in tdm_tx_slot, so the stack
   # disables stereo TX and the mixer has to match. No loss on this board - there
   # is one NS4150B driving one speaker off PA_OUTL+/-.
+  #
+  # Task stacks live in PSRAM, not internal RAM. This device runs on a razor's
+  # edge of internal heap (a few KB free with music playing), and these tasks
+  # are created lazily the moment a stream starts. When TTS/announcement audio
+  # starts while sendspin music is already playing, the announcement read task
+  # (5 KB), decode task (5 KB), mixer task (4 KB) and resampler task (3 KB)
+  # used to all land in internal RAM at once - on top of the HTTPS/TLS buffers
+  # the announcement reader needs to fetch the TTS file. Internal heap hit
+  # 2.9 KB free, realloc() of the HTTP header buffer returned NULL, mem_check()
+  # asserted, and the device panicked with an IllegalInstruction abort. Keeping
+  # these stacks in PSRAM preserves the internal headroom the TLS path needs.
   - platform: mixer
     id: mixing_speaker
     output_speaker: i2s_audio_speaker
     num_channels: 1
+    task_stack_in_psram: true
     source_speakers:
       - id: announcement_mixing_input
-        timeout: never
-      - id: media_mixing_input
         timeout: never
       - id: sendspin_mixing_input
         timeout: never
@@ -1705,63 +1718,56 @@ speaker:
   - platform: resampler
     id: announcement_resampling_speaker
     output_speaker: announcement_mixing_input
-  - platform: resampler
-    id: media_resampling_speaker
-    output_speaker: media_mixing_input
+    task_stack_in_psram: true
   - platform: resampler
     id: sendspin_resampling_speaker
     output_speaker: sendspin_mixing_input
+    task_stack_in_psram: true
 
 media_player:
   - platform: speaker
     id: external_media_player
     name: None
-    internal: False
+    internal: True
     volume_increment: 0.01
-    # Volume limits, and why they are no longer 0.4/0.8.
+    # The announcement read/decode tasks are created lazily when an
+    # announcement starts, so their 5 KB + 5 KB stacks land in internal RAM at
+    # exactly the worst moment (mid-music). See the mixer/resampler comment
+    # above for why that panics. Keep them in PSRAM.
+    task_stack_in_psram: true
+    # Volume is deliberately pinned to 1.0 and the entity hidden. ESPAudioStack
+    # exposes exactly ONE output gain - every media player's set_volume() funnels
+    # down through the mixer into ESPAudioStack::set_output_volume(), a single
+    # software q31 gain applied to every stream, voice included. That is why the
+    # old Sendspin slider dragged voice volume with it: both sliders were
+    # hanging off the same global knob.
     #
-    # These are the ends of a remap: HA's 0..100% becomes volume_min..volume_max,
-    # which the speaker chain hands to ESPAudioStack::set_output_volume() - a
-    # software gain that is linear in dB from -49 dB at 0.0 to 0 dB at 1.0.
-    # 0.8 therefore meant -9.8 dB, and full volume was a tenth of the power it
-    # could have been.
-    #
-    # The old i2s_audio speaker had `audio_dac: es8311_dac`, so the same 0.8 went
-    # to the ES8311's volume register instead: 0.8 * 255 = 204, and 0xBF is 0 dB
-    # at 0.5 dB a step, i.e. *+6.5 dB*. That is the 16 dB that went missing in
-    # the migration, and it is why this got quieter than it used to be.
-    #
-    # 1.0 buys 9.8 dB of it back. The last 6.5 dB is not reachable from YAML:
-    # esp_audio_stack clamps both its volume curves at 0 dB, so unity really is
-    # the ceiling now. It would need the component to allow a positive
-    # master_volume_max_db - the ES8311 register goes to +32 dB and
-    # esp_codec_dev_set_vol_curve takes a float - or ESPHome's es8311 audio_dac
-    # driving the same chip the stack is already driving, which is worse than
-    # being 6.5 dB down.
-    #
-    # volume_min drops to match: on the old ES8311 curve 0.4 was -44.5 dB, and
-    # 0.1 on this one is -44.1 dB, so the bottom of the HA slider is unchanged.
-    volume_min: 0.1
+    # All per-stream volume therefore happens on the mixer instead, where ducking
+    # attenuates each source BEFORE the shared output stage. The "Voice/Alerts
+    # Volume" and "Sendspin Volume" numbers (number: section below) drive that,
+    # and this player must stay at unity or it re-couples the streams behind
+    # those knobs. volume_min/volume_max clamp the value the player hands to the
+    # speaker chain, so with both ends at 1.0 every incoming volume pins to 1.0
+    # and the global stage never moves.
+    volume_min: 1.0
     volume_max: 1.0
     announcement_pipeline:
       speaker: announcement_resampling_speaker
       format: FLAC # FLAC is the least processor intensive codec
       num_channels: 1 # Stereo audio is unnecessary for announcements
       sample_rate: 48000 #Supported by Music Assistant
-    media_pipeline:
-      speaker: media_resampling_speaker
-      format: FLAC # FLAC is the least processor intensive codec
-      num_channels: 1 # follows the mono mixer above
-      sample_rate: 48000
+    # No media_pipeline on purpose: nothing plays music locally any more - that
+    # is sendspin's job - so the only thing this player can carry is voice and
+    # alerts. HA sending media to the "None" entity now does nothing, which is
+    # the desired behaviour rather than a bug.
     on_announcement:
-      - mixer_speaker.apply_ducking:
-          id: media_mixing_input
-          decibel_reduction: 20
-          duration: 0.0s
-      - mixer_speaker.apply_ducking:
-          id: sendspin_mixing_input
-          decibel_reduction: 20
-          duration: 0.0s
+      # +20 dB over its resting knob level, sendspin only (there is no local
+      # media stream left to duck). The announcement stream itself only ever
+      # carries its knob level - see apply_volume_ducking.
+      - script.execute:
+          id: apply_volume_ducking
+          base_extra_db: 20
+          duration_ms: 0
     on_state:
       - if:
           condition:
@@ -1773,14 +1779,11 @@ media_player:
                   media_player.is_announcing:
                     id: external_media_player
           then:
-            - mixer_speaker.apply_ducking:
-                id: media_mixing_input
-                decibel_reduction: 0
-                duration: 1.0s
-            - mixer_speaker.apply_ducking:
-                id: sendspin_mixing_input
-                decibel_reduction: 0
-                duration: 1.0s
+            # Back to the resting knob levels, ramping like the old 0 dB restore.
+            - script.execute:
+                id: apply_volume_ducking
+                base_extra_db: 0
+                duration_ms: 1000
       - script.execute: control_leds
     on_mute:
       - delay: 100ms # Debounce
@@ -1788,13 +1791,6 @@ media_player:
     on_unmute:
       - delay: 100ms # Debounce
       - script.execute: control_leds_volume_changed
-    on_volume:
-      if:
-        condition:
-          - lambda: return !id(init_in_progress);
-        then:
-          - delay: 100ms # Debounce
-          - script.execute: control_leds_volume_changed
     files:
       - id: mute_switch_on_sound
         file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_on.flac
@@ -1809,10 +1805,20 @@ media_player:
 
   # Sendspin's own media_player entity, entirely separate from the one above.
   # It feeds sendspin_media_source into its own resampler/mixer input, so it
-  # plays alongside announcements/media rather than through them.
+  # plays alongside announcements rather than through them. It is also the only
+  # path music can take on this device - see the no-media_pipeline note above.
+  #
+  # Internal and pinned to 1.0 for the same reason as external_media_player:
+  # this player's set_volume() would otherwise land on the stack's single shared
+  # output gain and pull voice with it - which is the exact bug this section
+  # exists to avoid. Sendspin loudness lives in the "Sendspin Volume" number
+  # (mixer ducking on sendspin_mixing_input) instead.
   - platform: speaker_source
     id: sendspin_media_player
     name: "Sendspin"
+    internal: True
+    volume_min: 1.0
+    volume_max: 1.0
     media_pipeline:
       speaker: sendspin_resampling_speaker
       sources:
@@ -1868,14 +1874,12 @@ voice_assistant:
               priority: true
               sound_file: !lambda return id(error_cloud_expired);
   on_start:
-    - mixer_speaker.apply_ducking:
-        id: media_mixing_input
-        decibel_reduction: 30
-        duration: 0.0s
-    - mixer_speaker.apply_ducking:
-        id: sendspin_mixing_input
-        decibel_reduction: 30
-        duration: 0.0s
+    # Duck media and sendspin 30 dB over their resting knob levels so the reply
+    # is audible; the voice/announcement stream only ever carries its knob level.
+    - script.execute:
+        id: apply_volume_ducking
+        base_extra_db: 30
+        duration_ms: 0
   on_listening:
     - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
     - script.execute: control_leds
@@ -1925,14 +1929,10 @@ voice_assistant:
     - wait_until:
         not:
           voice_assistant.is_running:
-    - mixer_speaker.apply_ducking:
-        id: media_mixing_input
-        decibel_reduction: 0
-        duration: 1.0s
-    - mixer_speaker.apply_ducking:
-        id: sendspin_mixing_input
-        decibel_reduction: 0
-        duration: 1.0s
+    - script.execute:
+        id: apply_volume_ducking
+        base_extra_db: 0
+        duration_ms: 1000
     - if:
         condition:
           lambda: return id(voice_assistant_phase) == ${voice_assist_error_phase_id};
@@ -2300,8 +2300,8 @@ script:
           const bool init_progress  = id(init_in_progress);
           const bool muted          = id(mic_is_muted);
           const int  phase          = id(voice_assistant_phase);
-          const bool playing_music  = id(external_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING ||
-                                       id(sendspin_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING;
+          // No local media pipeline any more, so "music" is sendspin only.
+          const bool playing_music  = id(sendspin_media_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING;
 
           id(check_if_timers_active).execute();
           const bool timers_active = id(is_timer_active);
@@ -2450,6 +2450,34 @@ script:
           ESP_LOGD("led", "volume_changed: flash white");
       - delay: 1.2s
       - script.execute: control_leds
+
+  # Volume plumbing for the two knobs in number:. Reads the current knob values,
+  # converts each to a dB ducking level (100% -> 0 dB, 0% -> -49 dB, the same
+  # -49 dB floor the old software volume slider had) and applies it to the mixer
+  # sources - attenuation per stream, BEFORE the stack's single shared output
+  # gain, which is the only way two independent volume knobs can exist on this
+  # hardware (see the pinning comment on external_media_player).
+  #
+  # base_extra_db layers event ducking on top of the resting knob level for the
+  # streams being sidelined: +20 during announcements and the timer, +30 while
+  # voice is running. Sendspin is the only sidelineable stream now (the local
+  # media input is gone), and the announcement/voice stream gets ONLY the knob
+  # level, never the extra, or a voice reply would duck its own audio.
+  - id: apply_volume_ducking
+    parameters:
+      base_extra_db: int
+      duration_ms: uint32_t
+    then:
+      - lambda: |-
+          const uint32_t ms = duration_ms;
+          auto duck = [ms](float pct, int extra, auto *source) {
+            float db = 49.0f * (1.0f - pct / 100.0f) + (float) extra;
+            if (db < 0.0f) db = 0.0f;
+            if (db > 50.0f) db = 50.0f;
+            source->apply_ducking((uint8_t) db, ms);
+          };
+          duck(id(sendspin_volume).state, base_extra_db, id(sendspin_mixing_input));
+          duck(id(voice_volume).state, 0, id(announcement_mixing_input));
 
   - id: ring_timer
     then:
@@ -2814,24 +2842,16 @@ switch:
             media_player.stop:
               id: external_media_player
               announcement: true
-      - mixer_speaker.apply_ducking:
-          id: media_mixing_input
-          decibel_reduction: 0
-          duration: 1.0s
-      - mixer_speaker.apply_ducking:
-          id: sendspin_mixing_input
-          decibel_reduction: 0
-          duration: 1.0s
+      - script.execute:
+          id: apply_volume_ducking
+          base_extra_db: 0
+          duration_ms: 1000
       - script.execute: control_leds
     on_turn_on:
-      - mixer_speaker.apply_ducking:
-          id: media_mixing_input
-          decibel_reduction: 20
-          duration: 0.0s
-      - mixer_speaker.apply_ducking:
-          id: sendspin_mixing_input
-          decibel_reduction: 20
-          duration: 0.0s
+      - script.execute:
+          id: apply_volume_ducking
+          base_extra_db: 20
+          duration_ms: 0
       - micro_wake_word.enable_model: stop
       - script.execute: ring_timer
       - script.execute: control_leds
@@ -3022,6 +3042,85 @@ number:
     initial_value: 0.25
     mode: slider
 
+  # The two volume knobs, and why they live here and not on the media players.
+  #
+  # ESPAudioStack has a single output gain that every stream shares (see the
+  # pinning comment on external_media_player), so per-stream volume has to
+  # happen on the mixer, which ducks each source before the shared stage. These
+  # knobs convert 0..100% into a dB reduction via apply_volume_ducking: 100% =
+  # 0 dB (no ducking), 0% = -49 dB, matching the old software volume curve.
+  #
+  # "Voice/Alerts Volume" covers everything that is not sendspin: voice replies,
+  # alerts and timer sounds (the announcement stream). "Sendspin Volume" covers
+  # just the sendspin source - which is also the only way music can reach this
+  # device, since the local media pipeline was removed. Turning one down no
+  # longer touches the other.
+  #
+  # The guard skips re-application while voice, an announcement or the timer is
+  # ducking on top of the knobs - those restore the knob levels when they end.
+  # The LED flash replaces the old on_volume flash on the now-hidden media
+  # player, and the physical volume buttons adjust the Voice/Alerts knob.
+  - platform: template
+    id: voice_volume
+    name: "Voice and Alerts Volume"
+    icon: mdi:volume-high
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: true
+    initial_value: 100
+    min_value: 0
+    max_value: 100
+    step: 1
+    mode: slider
+    on_value:
+      - if:
+          condition:
+            and:
+              - not:
+                  voice_assistant.is_running:
+              - not:
+                  media_player.is_announcing:
+                    id: external_media_player
+              - switch.is_off: timer_ringing
+          then:
+            - script.execute:
+                id: apply_volume_ducking
+                base_extra_db: 0
+                duration_ms: 0
+      - if:
+          condition:
+            - lambda: return !id(init_in_progress);
+          then:
+            - delay: 100ms # Debounce
+            - script.execute: control_leds_volume_changed
+  - platform: template
+    id: sendspin_volume
+    name: "Sendspin Volume"
+    icon: mdi:volume-high
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: true
+    initial_value: 100
+    min_value: 0
+    max_value: 100
+    step: 1
+    mode: slider
+    on_value:
+      - if:
+          condition:
+            and:
+              - not:
+                  voice_assistant.is_running:
+              - not:
+                  media_player.is_announcing:
+                    id: external_media_player
+              - switch.is_off: timer_ringing
+          then:
+            - script.execute:
+                id: apply_volume_ducking
+                base_extra_db: 0
+                duration_ms: 0
+
 sensor:
   - platform: template
     id: next_timer
@@ -3194,7 +3293,7 @@ binary_sensor:
       number: 9
       inverted: true
     on_press:
-      - media_player.volume_down: external_media_player
+      - number.decrement: voice_volume
 
   - platform: gpio
     id: key2_button
@@ -3214,4 +3313,4 @@ binary_sensor:
       number: 11
       inverted: true
     on_press:
-      - media_player.volume_up: external_media_player
+      - number.increment: voice_volume
