@@ -182,6 +182,13 @@ esp32:
   framework:
     type: esp-idf
     version: recommended
+    # esp_afe asks for esp-sr ^2.4.6, which a fresh build resolved to 2.6.0 on
+    # 2026-10-10. That cost ~17 KB of internal heap at idle (24 KB free on
+    # 2.4.7 builds, 7 KB on 2.6.0) - enough that a second API client starved
+    # the device off the network. Pin it until something needs the newer one.
+    components:
+      - name: espressif/esp-sr
+        ref: 2.4.7
     sdkconfig_options:
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
