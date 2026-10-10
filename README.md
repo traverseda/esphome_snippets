@@ -125,6 +125,58 @@ packages:
 Don't add `id:` to your `wifi:` or `api:` — the package sets `wifi_id` and
 `api_id` and its LED scripts read them.
 
+## The speaker's mic on your desktop
+
+Turn on **Stream microphone to network** (a config switch on the device) and
+the speaker announces its microphone over SAP and streams it as RTP. The
+stream is the same cleaned-up, post-echo-cancellation audio the wake word
+hears, at 16 kHz mono. PipeWire turns each announced speaker into an input
+device named `<friendly_name> mic`. There's nothing to configure per device.
+Switching the stream off removes the input right away.
+
+It's off by default. RTP multicast over WiFi goes out at the access point's
+slowest basic rate, so a stream nobody is listening to still uses airtime.
+While the mic is muted, the stream carries silence.
+
+Desktop side, once (NixOS):
+
+```nix
+services.pipewire.extraConfig.pipewire."60-rtp-sap" = {
+  "context.modules" = [{
+    name = "libpipewire-module-rtp-sap";
+    args."stream.rules" = [{
+      matches = [{ "rtp.session" = "~.*"; }];
+      actions.create-stream = {
+        "media.class" = "Audio/Source";   # an input device, not a playback stream
+        "sess.latency.msec" = 160;
+      };
+    }];
+  }];
+};
+networking.firewall.allowedUDPPorts = [ 9875 ];                      # SAP
+networking.firewall.allowedUDPPortRanges = [{ from = 46000; to = 46099; }];  # RTP
+```
+
+Elsewhere, put the same thing in `~/.config/pipewire/pipewire.conf.d/60-rtp-sap.conf`.
+
+Both receiver settings matter, and PipeWire's defaults get them wrong:
+
+- **`media.class`**: without it, the SAP module creates a *playback* stream
+  wired to your default output. You'd hear the room through your desktop
+  speakers, and there'd be no input device to record from.
+- **`sess.latency.msec`**: PipeWire subtracts the graph quantum (1024 samples,
+  64 ms at 16 kHz) from this before using what's left as jitter buffer. The
+  speaker sends in bursts of about three packets every ~64 ms. At 40 ms the
+  buffer is negative, and at 60 ms it is still under the quantum. Either way
+  you record pure silence with a stream of "receiver read overrun" warnings.
+  160 ms leaves ~96 ms of real buffer, enough to smooth the bursts.
+
+To debug the audio front end, record it and open it in Audacity:
+
+```sh
+pw-record --target "speaker-alfa mic" --rate 16000 --channels 1 capture.wav
+```
+
 ## Known limitation: a TV in the room
 
 **Symptom.** Say the wake word while a TV is playing dialogue and the command

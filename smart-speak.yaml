@@ -1555,6 +1555,20 @@ output:
 external_components:
   - source: github://n-IA-hane/esphome-audio-stack@v2026.7.0
     components: [esp_audio_stack, esp_afe]
+  - source: github://traverseda/esphome_snippets@main
+    components: [sap_mic]
+
+# The cleaned-up (post-AEC/NS) mic as a network audio source. It announces
+# itself over SAP, so PipeWire's module-rtp-sap turns it into an input device
+# with no per-device setup (see the README). Off by default and toggled by the
+# "Stream microphone to network" switch: RTP multicast over WiFi goes out at the
+# AP's lowest basic rate, so a stream nobody is listening to still costs airtime.
+# Passive - it only forwards what the mic is already capturing, and the mute
+# switch zeroes the gain upstream of it, so muted means a silent stream.
+sap_mic:
+  id: network_mic
+  microphone: clean_mic
+  enabled: false
 
 esp_afe:
   id: afe_processor
@@ -2803,6 +2817,19 @@ switch:
       number: $amp_ctrl
       inverted: false
     restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    id: network_mic_switch
+    name: "Stream microphone to network"
+    icon: mdi:access-point-network
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: |-
+      return id(network_mic).is_enabled();
+    turn_on_action:
+      - lambda: id(network_mic).set_enabled(true);
+    turn_off_action:
+      - lambda: id(network_mic).set_enabled(false);
 
   - platform: template
     id: mic_mute_switch
