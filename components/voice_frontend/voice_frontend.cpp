@@ -9,6 +9,7 @@
 #include <esp_heap_caps.h>
 #include <esp_ns.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -238,6 +239,7 @@ void VoiceFrontend::run_ns_agc_(int16_t *mix, int16_t *aec, size_t n) {
       this->acc_sq_[s] += (double) stages[s][i] * stages[s][i];
   }
   this->acc_n_ += n;
+  this->update_speech_score_(this->out_buf_, n);
   if (this->mic_ != nullptr)
     this->mic_->on_frames(this->emit_buf_, n);
 
@@ -252,6 +254,28 @@ void VoiceFrontend::run_ns_agc_(int16_t *mix, int16_t *aec, size_t n) {
     this->acc_started_ms_ = now;
     this->levels_ready_.store(true);
   }
+}
+
+void VoiceFrontend::update_speech_score_(const int16_t *out, size_t n) {
+  for (size_t i = 0; i < n; i++)
+    this->score_acc_ += (double) out[i] * out[i];
+  this->score_n_ += n;
+  if (this->score_n_ < SAMPLE_RATE / 10)
+    return;
+  const double rms = sqrt(this->score_acc_ / this->score_n_);
+  const float db = rms > 0 ? 20.0f * log10f((float) (rms / 32768.0)) : -120.0f;
+  this->score_acc_ = 0;
+  this->score_n_ = 0;
+  this->score_blocks_[this->score_head_] = db;
+  this->score_head_ = (this->score_head_ + 1) % SCORE_BLOCKS;
+  float peak = -120.0f;
+  for (float b : this->score_blocks_)
+    peak = std::max(peak, b);
+  // Background: drops quickly to any quieter block (a pause is the room),
+  // creeps up over ~20 s, so speech bursts barely move it.
+  this->floor_db_ += (db < this->floor_db_ ? 0.3f : 0.005f) * (db - this->floor_db_);
+  this->wake_peak_db_.store(peak);
+  this->noise_floor_db_.store(this->floor_db_);
 }
 
 void VoiceFrontend::loop() {
@@ -298,14 +322,23 @@ void VoiceFrontendMicrophone::setup() {
   this->parent_->set_microphone(this);
 }
 
+// Shared by several MicrophoneSources (wake word, voice assistant, network
+// stream), each of which calls start()/stop() on the microphone itself. So
+// count them: one consumer stopping must not silence the others. Without
+// this, the voice assistant ending a command stopped the wake word's audio.
 void VoiceFrontendMicrophone::start() {
   if (this->is_failed() || this->parent_->is_failed())
     return;
+  this->users_++;
   this->state_ = microphone::STATE_RUNNING;
   this->running_.store(true);
 }
 
 void VoiceFrontendMicrophone::stop() {
+  if (this->users_ > 0)
+    this->users_--;
+  if (this->users_ > 0)
+    return;
   this->running_.store(false);
   this->state_ = microphone::STATE_STOPPED;
 }

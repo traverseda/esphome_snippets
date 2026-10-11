@@ -1563,7 +1563,7 @@ external_components:
       url: https://github.com/traverseda/esphome_snippets
       ref: main
     refresh: 0s
-    components: [audio_io, voice_frontend, sap_mic]
+    components: [audio_io, voice_frontend, sap_mic, wake_arbiter]
 
 # The board's audio, end to end, in our own components (docs/rewrite-plan.md):
 #   audio_io        I2S0 TDM bus, ES7210 4-channel ADC (capture), ES8311 DAC
@@ -2004,17 +2004,33 @@ micro_wake_word:
                                 id: external_media_player
                                 announcement: true
                           else:
-                            - if:
-                                condition:
-                                  switch.is_on: wake_sound
-                                then:
-                                  - script.execute:
-                                      id: play_sound
-                                      priority: true
-                                      sound_file: !lambda return id(wake_word_triggered_sound);
-                                  - delay: 300ms
-                            - voice_assistant.start:
-                                wake_word: !lambda return wake_word;
+                            # Don't answer yet: settle with the other speakers
+                            # which one heard it best (wake_arbiter below).
+                            # Ends in its on_win or on_lose.
+                            - lambda: id(arbiter).claim(wake_word);
+
+# Picks one speaker when several hear the same wake word. Without it Home
+# Assistant keeps whichever pipeline arrives first, which is often a far
+# speaker that then can't hear the command. Each speaker multicasts how
+# clearly it heard the wake word (speech SNR from voice_frontend), waits 200 ms
+# for the others, and only the best one chimes and starts the assistant.
+# Decisions are logged with every score seen ("wake_arbiter" in the log).
+wake_arbiter:
+  id: arbiter
+  voice_frontend_id: vfe
+  window: 200ms
+  on_win:
+    - if:
+        condition:
+          switch.is_on: wake_sound
+        then:
+          - script.execute:
+              id: play_sound
+              priority: true
+              sound_file: !lambda return id(wake_word_triggered_sound);
+          - delay: 300ms
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
 
 globals:
   - id: mic_is_muted
@@ -2776,6 +2792,20 @@ switch:
       number: $amp_ctrl
       inverted: false
     restore_mode: RESTORE_DEFAULT_ON
+
+  # Off: every speaker that hears the wake word answers on its own, and Home
+  # Assistant keeps the first to arrive - the old behaviour.
+  - platform: template
+    id: wake_arbitration
+    name: "Wake word arbitration"
+    icon: mdi:account-voice
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: return id(arbiter).is_enabled();
+    turn_on_action:
+      - lambda: id(arbiter).set_enabled(true);
+    turn_off_action:
+      - lambda: id(arbiter).set_enabled(false);
 
   - platform: template
     id: network_mic_switch

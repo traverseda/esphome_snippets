@@ -520,14 +520,23 @@ void AudioIOMicrophone::setup() {
   this->parent_->add_frame_listener([this](const int32_t *frames, size_t count) { this->on_frames(frames, count); });
 }
 
+// Shared by several MicrophoneSources (wake word, voice assistant, network
+// stream), each of which calls start()/stop() on the microphone itself. So
+// count them: one consumer stopping must not silence the others. Without
+// this, the voice assistant ending a command stopped the wake word's audio.
 void AudioIOMicrophone::start() {
   if (this->is_failed() || this->parent_->is_failed())
     return;
+  this->users_++;
   this->state_ = microphone::STATE_RUNNING;
   this->running_.store(true);
 }
 
 void AudioIOMicrophone::stop() {
+  if (this->users_ > 0)
+    this->users_--;
+  if (this->users_ > 0)
+    return;
   this->running_.store(false);
   this->state_ = microphone::STATE_STOPPED;
 }

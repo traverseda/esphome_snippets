@@ -87,12 +87,20 @@ class VoiceFrontend : public Component {
   float get_stage_level(Tap stage) const { return this->levels_[(uint8_t) stage]; }
   uint32_t get_dropped_frames() const { return this->dropped_frames_.load(); }
 
+  // How well this device is hearing speech right now: the loudest 100 ms of
+  // the processed output over the last 1.5 s, minus the tracked background
+  // level, dB. Read at wake-word time it says how clearly the wake word came
+  // through - the figure wake_arbiter compares between speakers.
+  float get_speech_snr_db() const { return this->wake_peak_db_.load() - this->noise_floor_db_.load(); }
+  float get_noise_floor_db() const { return this->noise_floor_db_.load(); }
+
  protected:
   void on_capture_(const int32_t *frames, size_t count);
   static void process_task_(void *arg);
   void process_loop_();
   void run_ns_agc_(int16_t *mix, int16_t *aec, size_t n);
   void apply_pending_();
+  void update_speech_score_(const int16_t *out, size_t n);
 
   audio_io::AudioIO *io_{nullptr};
   VoiceFrontendMicrophone *mic_{nullptr};
@@ -132,6 +140,16 @@ class VoiceFrontend : public Component {
   size_t fifo_len_{0};
   int16_t *ns_buf_{nullptr}, *out_buf_{nullptr}, *emit_buf_{nullptr};
 
+  // Speech score, processing task only (atomics are the published results).
+  static constexpr uint8_t SCORE_BLOCKS = 15;  // x 100 ms
+  double score_acc_{0};
+  uint32_t score_n_{0};
+  float score_blocks_[SCORE_BLOCKS]{-120, -120, -120, -120, -120, -120, -120, -120,
+                                    -120, -120, -120, -120, -120, -120, -120};
+  uint8_t score_head_{0};
+  float floor_db_{-60.0f};
+  std::atomic<float> wake_peak_db_{-120.0f}, noise_floor_db_{-60.0f};
+
   // Per-stage levels.
   double acc_sq_[NUM_STAGES]{};
   uint32_t acc_n_{0};
@@ -153,6 +171,7 @@ class VoiceFrontendMicrophone : public microphone::Microphone, public Component,
  protected:
   std::vector<uint8_t> buffer_;
   std::atomic<bool> running_{false};
+  uint8_t users_{0};  // started MicrophoneSources; start()/stop() come from the main loop
 };
 
 }  // namespace esphome::voice_frontend

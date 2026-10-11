@@ -228,6 +228,7 @@ class AudioIOMicrophone : public microphone::Microphone, public Component, publi
  protected:
   std::vector<uint8_t> buffer_;
   std::atomic<bool> running_{false};
+  uint8_t users_{0};  // started MicrophoneSources; start()/stop() come from the main loop
 };
 
 // Stock ESPHome speaker on top of AudioIO: 16-bit mono at the bus rate, into a
