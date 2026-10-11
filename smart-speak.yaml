@@ -1555,7 +1555,14 @@ output:
 # downstream does not change the relationship.
 # ---------------------------------------------------------------------------
 external_components:
-  - source: github://traverseda/esphome_snippets@main
+  # refresh: 0s, same as the package itself in each device file: with the
+  # default one-day cache a build could pair a fresh smart-speak.yaml with
+  # yesterday's components, and they change together.
+  - source:
+      type: git
+      url: https://github.com/traverseda/esphome_snippets
+      ref: main
+    refresh: 0s
     components: [audio_io, voice_frontend, sap_mic]
 
 # The board's audio, end to end, in our own components (docs/rewrite-plan.md):
