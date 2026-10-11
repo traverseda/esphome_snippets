@@ -1,0 +1,329 @@
+# Phase 0/2 bench firmware (docs/rewrite-plan.md) for the Waveshare
+# ESP32-S3-AUDIO-Board: our own audio_io + voice_frontend, nothing else running.
+#
+# Streams a 2-channel SAP/RTP source ("<friendly_name> mic", L16/16000/2):
+#   left  = processed output (what wake word / STT would get)
+#   right = debug tap, any stage, picked by "Debug tap"
+# Every stage has a switch, so each one is A/B-able by ear and with
+# tools/capture.py. Playback goes through audio_io's own speaker and a bare
+# media player ("Bench player"), so AEC has something to cancel. No wake word,
+# voice assistant or LEDs yet.
+#
+# Device file supplies esphome: name, wifi, api, ota, logger; this package
+# supplies the rest:
+#
+#   packages:
+#     spike: github://traverseda/esphome_snippets/dev/audio-io-spike.yaml@main
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    version: recommended
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+external_components:
+  - source: github://traverseda/esphome_snippets@main
+    components: [audio_io, voice_frontend, sap_mic]
+
+i2c:
+  - id: internal_i2c
+    sda: GPIO11
+    scl: GPIO10
+    frequency: 100kHz
+
+audio_io:
+  id: aio
+  i2c_id: internal_i2c
+  mclk_pin: GPIO12
+  bclk_pin: GPIO13
+  lrclk_pin: GPIO14
+  din_pin: GPIO15
+  dout_pin: GPIO16
+  es8311:
+    volume_max_db: 6.5
+  es7210:
+    mic_gain_db: 37.5  # maximum; measured: room peaks ~-37 dBFS, no clipping
+    mic_hpf: 2         # A/B by ear 2026-10-10: 2 best; 3-5 worse, 0 unusable
+    ref_adc_channel: 2
+    # Measured with playback, 2026-10-10: 0 dB left the reference ~25 dB under
+    # the echo and AEC removed only ~5 dB; 12 and 24 dB both gave ~18 dB.
+    ref_gain_db: 18
+
+voice_frontend:
+  id: vfe
+  audio_io_id: aio
+  mic_mix: average
+  input_gain_db: 6     # before AEC: headroom for the speaker's own echo
+  makeup_gain_db: 24   # after AEC: 30 dB total, the level picked by ear
+  # Setting "A" from the 2026-10-10 listening sweep: HPF 2 + input gain 30 dB,
+  # with WebRTC NS and AGC both bypassed - each made speech worse by ear.
+  aec:
+    enabled: true
+  ns:
+    enabled: false
+    mode: 2
+  agc:
+    enabled: false
+    target_level_dbfs: 3
+    compression_gain_db: 24
+  tap: mix
+
+microphone:
+  - platform: voice_frontend
+    id: clean_mic
+    voice_frontend_id: vfe
+
+tca9555:
+  id: ioexp
+  i2c_id: internal_i2c
+  address: 0x20
+
+speaker:
+  - platform: audio_io
+    id: bench_speaker
+    audio_io_id: aio
+
+media_player:
+  - platform: speaker
+    id: bench_player
+    name: "Bench player"
+    announcement_pipeline:
+      speaker: bench_speaker
+      format: FLAC
+      num_channels: 1
+      sample_rate: 16000
+
+esphome:
+  on_boot:
+    - priority: -100
+      then:
+        - microphone.capture: clean_mic
+
+sap_mic:
+  id: network_mic
+  microphone:
+    microphone: clean_mic
+    channels: [0, 1]   # processed, tap
+  enabled: true
+
+# Raw ES7210 register access for experiments the codec library doesn't expose
+# (its high-pass filter at 0x20-0x23, mic bias at 0x41/0x42, ...). Results land
+# in the device log.
+api:
+  actions:
+    - action: es7210_read
+      variables:
+        reg: int
+      then:
+        - lambda: |-
+            ESP_LOGI("es7210", "reg 0x%02X = 0x%02X", reg, id(aio).read_es7210_reg(reg));
+    - action: es7210_write
+      variables:
+        reg: int
+        value: int
+      then:
+        - lambda: id(aio).write_es7210_reg(reg, value);
+
+number:
+  # Digital gain in the 24 -> 16 bit conversion, ahead of AEC.
+  - platform: template
+    name: "Input gain"
+    unit_of_measurement: dB
+    min_value: 0
+    max_value: 42
+    step: 3
+    initial_value: 6
+    optimistic: true
+    on_value:
+      - lambda: id(vfe).set_input_gain_db(x);
+  # Digital gain after AEC, before NS.
+  - platform: template
+    name: "Makeup gain"
+    unit_of_measurement: dB
+    min_value: 0
+    max_value: 42
+    step: 3
+    initial_value: 24
+    optimistic: true
+    on_value:
+      - lambda: id(vfe).set_makeup_gain_db(x);
+  # ES7210 analog gain on the AEC reference (physical ADC channel 2 = MIC3).
+  - platform: template
+    name: "Reference PGA"
+    unit_of_measurement: dB
+    min_value: 0
+    max_value: 37.5
+    step: 1.5
+    initial_value: 18
+    optimistic: true
+    on_value:
+      - lambda: id(aio).set_adc_channel_gain_db(2, x);
+  # Playback: ES8311 DAC volume, bypassing the media player's curve.
+  - platform: template
+    name: "DAC volume"
+    unit_of_measurement: dB
+    min_value: -40
+    max_value: 6.5
+    step: 0.5
+    initial_value: -6.5
+    optimistic: true
+    on_value:
+      - lambda: id(aio).set_output_db(x);
+  # ES7210 analog gain on both mics (not the reference). It accepts 0-33 dB in
+  # 3 dB steps, then 34.5 / 36 / 37.5.
+  - platform: template
+    id: mic_pga
+    name: "Mic PGA"
+    unit_of_measurement: dB
+    min_value: 0
+    max_value: 37.5
+    step: 1.5
+    initial_value: 37.5
+    optimistic: true
+    on_value:
+      - lambda: id(aio).set_mic_gain_db(x);
+  # Hardware high-pass coefficient; lower = higher cutoff. 10 = codec default (effectively off).
+  - platform: template
+    name: "Mic HPF coefficient"
+    min_value: 1
+    max_value: 13
+    step: 1
+    initial_value: 2
+    optimistic: true
+    on_value:
+      - lambda: id(aio).set_mic_hpf((uint8_t) x);
+  - platform: template
+    name: "NS mode"
+    min_value: 0
+    max_value: 2
+    step: 1
+    initial_value: 2
+    optimistic: true
+    on_value:
+      - lambda: id(vfe).set_ns_mode((int) x);
+  - platform: template
+    id: agc_target
+    name: "AGC target"
+    unit_of_measurement: "-dBFS"
+    min_value: 0
+    max_value: 31
+    step: 1
+    initial_value: 3
+    optimistic: true
+    on_value:
+      - lambda: id(vfe).set_agc_config((int) x, (int) id(agc_gain).state, true);
+  - platform: template
+    id: agc_gain
+    name: "AGC max gain"
+    unit_of_measurement: dB
+    min_value: 0
+    max_value: 60
+    step: 1
+    initial_value: 24
+    optimistic: true
+    on_value:
+      - lambda: id(vfe).set_agc_config((int) id(agc_target).state, (int) x, true);
+
+select:
+  - platform: template
+    name: "Mic mix"
+    options: [mic1, mic2, average]
+    initial_option: average
+    optimistic: true
+    on_value:
+      - lambda: id(vfe).set_mic_mix((voice_frontend::MicMix) i);
+  - platform: template
+    name: "Debug tap"
+    options: [mix, aec, ns, output]
+    initial_option: mix
+    optimistic: true
+    on_value:
+      - lambda: id(vfe).set_tap((voice_frontend::Tap) i);
+
+switch:
+  - platform: template
+    name: "AEC"
+    restore_mode: ALWAYS_ON
+    lambda: return id(vfe).is_aec_enabled();
+    turn_on_action:
+      - lambda: id(vfe).set_aec_enabled(true);
+    turn_off_action:
+      - lambda: id(vfe).set_aec_enabled(false);
+  - platform: template
+    name: "Noise suppression"
+    restore_mode: ALWAYS_OFF
+    lambda: return id(vfe).is_ns_enabled();
+    turn_on_action:
+      - lambda: id(vfe).set_ns_enabled(true);
+    turn_off_action:
+      - lambda: id(vfe).set_ns_enabled(false);
+  - platform: template
+    name: "AGC"
+    restore_mode: ALWAYS_OFF
+    lambda: return id(vfe).is_agc_enabled();
+    turn_on_action:
+      - lambda: id(vfe).set_agc_enabled(true);
+    turn_off_action:
+      - lambda: id(vfe).set_agc_enabled(false);
+  - platform: gpio
+    name: "Amplifier"
+    pin:
+      tca9555: ioexp
+      number: 8
+    restore_mode: ALWAYS_ON
+  - platform: template
+    id: network_mic_switch
+    name: "Stream microphone to network"
+    restore_mode: ALWAYS_ON
+    lambda: return id(network_mic).is_enabled();
+    turn_on_action:
+      - lambda: id(network_mic).set_enabled(true);
+    turn_off_action:
+      - lambda: id(network_mic).set_enabled(false);
+
+sensor:
+  - platform: template
+    name: "Raw mic1 RMS"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return id(aio).get_stats(0).rms_dbfs;
+  - platform: template
+    name: "Raw mic2 RMS"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return id(aio).get_stats(1).rms_dbfs;
+  - platform: template
+    name: "Raw ref RMS"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return id(aio).get_stats(2).rms_dbfs;
+  - platform: template
+    name: "Front end mix level"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return id(vfe).get_stage_level(voice_frontend::Tap::MIX);
+  - platform: template
+    name: "Front end output level"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return id(vfe).get_stage_level(voice_frontend::Tap::OUTPUT);
+  - platform: debug
+    free:
+      name: "Heap free"
+    block:
+      name: "Heap max block"
+
+debug:
+  update_interval: 30s

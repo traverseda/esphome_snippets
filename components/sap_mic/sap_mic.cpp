@@ -33,7 +33,7 @@ static constexpr size_t RTP_HEADER_BYTES = 12;
 static constexpr int MAX_PACKETS_PER_LOOP = 8;
 
 void SapMic::setup() {
-  const audio::AudioStreamInfo info = this->mic_->get_audio_stream_info();
+  const audio::AudioStreamInfo info = this->source_->get_audio_stream_info();
   if (info.get_bits_per_sample() != 16) {
     ESP_LOGE(TAG, "Only 16-bit microphones are supported (got %u-bit)", info.get_bits_per_sample());
     this->mark_failed();
@@ -47,6 +47,12 @@ void SapMic::setup() {
     return;
   }
   const size_t frame_bytes = 2 * this->channels_;
+  // Keep each RTP packet inside one Ethernet frame: IP fragments of a
+  // multicast stream over WiFi are lost far more often than whole packets.
+  // Multi-channel debug streams therefore get shorter packets.
+  static constexpr size_t MAX_PAYLOAD_BYTES = 1400;
+  while (this->packet_ms_ > 5 && this->sample_rate_ * this->packet_ms_ / 1000 * frame_bytes > MAX_PAYLOAD_BYTES)
+    this->packet_ms_ /= 2;
   this->samples_per_packet_ = this->sample_rate_ * this->packet_ms_ / 1000;
   this->payload_bytes_ = this->samples_per_packet_ * frame_bytes;
   const size_t buffer_bytes = this->sample_rate_ * this->buffer_ms_ / 1000 * frame_bytes;
@@ -65,20 +71,36 @@ void SapMic::setup() {
 
   if (this->session_name_.empty())
     this->session_name_ = App.get_friendly_name().str() + " mic";
-  this->ssrc_ = esp_random();
+  // Stable across reboots, unlike the timestamp and sequence start. A receiver
+  // locks onto the first SSRC it sees, and the SAP announcement is identical
+  // after a reboot, so a fresh random SSRC would leave PipeWire holding the old
+  // session and silently rejecting every new packet ("unexpected SSRC").
+  this->ssrc_ = fnv1_hash(App.get_name().str() + "/sap_mic") | 1;
   this->rtp_ts_ = esp_random();
   this->seq_ = esp_random() & 0xFFFF;
 
-  this->mic_->add_data_callback([this](const std::vector<uint8_t> &data) { this->on_audio_(data); });
+  this->source_->add_data_callback([this](const std::vector<uint8_t> &data) { this->on_audio_(data); });
 }
 
 // Runs on the audio task: no blocking, no allocation, no network I/O.
 void SapMic::on_audio_(const std::vector<uint8_t> &data) {
   if (!this->enabled_ || this->stream_ == nullptr)
     return;
-  const size_t sent = xStreamBufferSend(this->stream_, data.data(), data.size(), 0);
-  if (sent < data.size())
-    this->dropped_bytes_ += data.size() - sent;
+  // All or nothing. A stream buffer accepts partial writes, and a write cut
+  // mid-sample shifts every later sample by a byte - the receiver then decodes
+  // low bytes as high bytes and hears noise at full scale. This task is the
+  // only writer, so the free space can only grow between check and send.
+  if (xStreamBufferSpacesAvailable(this->stream_) < data.size()) {
+    this->dropped_bytes_ += data.size();
+    return;
+  }
+  xStreamBufferSend(this->stream_, data.data(), data.size(), 0);
+}
+
+void SapMic::drain_() {
+  uint8_t scratch[64];
+  while (xStreamBufferReceive(this->stream_, scratch, sizeof(scratch), 0) > 0) {
+  }
 }
 
 void SapMic::set_enabled(bool enabled) {
@@ -96,18 +118,20 @@ void SapMic::loop() {
   if (this->stream_ == nullptr)
     return;
 
+  if (this->gain_source_ != nullptr && this->gain_source_->get_gain_factor() != this->source_->get_gain_factor())
+    this->source_->set_gain_factor(this->gain_source_->get_gain_factor());
+
   if (!this->enabled_) {
     // Drain anything left from before the switch-off, so re-enabling starts
     // with fresh audio rather than a stale half second.
-    uint8_t scratch[64];
-    while (xStreamBufferReceive(this->stream_, scratch, sizeof(scratch), 0) > 0) {
-    }
+    this->drain_();
     return;
   }
 
   if (!network::is_connected()) {
     this->local_ip_ = 0;
     this->announced_ = false;
+    this->drain_();
     return;
   }
 
@@ -282,9 +306,11 @@ void SapMic::dump_config() {
                 "  Session: %s\n"
                 "  Format: L16/%u/%u, %u ms packets\n"
                 "  Port: %u\n"
+                "  Gain factor: %d%s\n"
                 "  Enabled: %s",
                 this->session_name_.c_str(), (unsigned) this->sample_rate_, this->channels_,
-                (unsigned) this->packet_ms_, this->port_, YESNO(this->enabled_));
+                (unsigned) this->packet_ms_, this->port_, (int) this->source_->get_gain_factor(),
+                this->gain_source_ != nullptr ? " (follows gain_source)" : "", YESNO(this->enabled_));
 }
 
 }  // namespace esphome::sap_mic

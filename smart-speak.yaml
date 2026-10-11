@@ -52,7 +52,7 @@ substitutions:
   rtc_int: 5 #ExtendedIO
 
   # The mic-channel lookup, the per-bus i2s_mode/bps/apll/mclk knobs and
-  # which_mic are all gone: esp_audio_stack owns the bus and the codecs now, and
+  # which_mic are all gone: audio_io owns the bus and the codecs now, and
   # takes its rates and slot layout from its own block below.
 
   led_num: '7' # WS2812 ring leds
@@ -64,7 +64,7 @@ substitutions:
   stalled_announcement_ms: '35000'
 
 esphome:
-  # esp_audio_stack is released against the 2026.7 component API.
+  # audio_io and voice_frontend are built against the 2026.7 component API.
   min_version: 2026.7.0
   on_boot:
     # Runs once ever, before priority 375 below makes the first real
@@ -84,22 +84,22 @@ esphome:
     # seeded flag so it never runs again and never overwrites a real choice.
     - priority: 400
       then:
-        # Feed Mic Reactive from the live mic stream instead of the
-        # divider-throttled TDM RMS probe (~4 Hz). ESPHome's standard
-        # microphone data callback fires once per delivered frame (~30 Hz,
-        # post-AEC/NS) whenever the mic is capturing, which is exactly the
+        # Feed Mic Reactive from the live mic stream. ESPHome's standard
+        # microphone data callback fires once per delivered frame (every
+        # 10 ms, post-AEC) whenever the mic is capturing, which is exactly the
         # "how well can it hear me" signal - the RMS lands in
-        # id(mic_audio_level) and the effect reads it every frame.
+        # id(mic_audio_level) and the effect reads it every frame. The stream
+        # is [output, debug tap] interleaved; only the output counts.
         - lambda: |-
             static bool mic_cb_registered = false;
             if (!mic_cb_registered) {
               mic_cb_registered = true;
               id(clean_mic).add_data_callback([](const std::vector<uint8_t> &data) {
                 const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
-                const size_t n = data.size() / 2;
+                const size_t n = data.size() / 4;
                 float sum = 0.0f;
                 for (size_t i = 0; i < n; i++) {
-                  const float v = samples[i];
+                  const float v = samples[i * 2];
                   sum += v * v;
                 }
                 const float rms = n > 0 ? sqrtf(sum / n) : 0.0f;
@@ -182,13 +182,9 @@ esp32:
   framework:
     type: esp-idf
     version: recommended
-    # esp_afe asks for esp-sr ^2.4.6, which a fresh build resolved to 2.6.0 on
-    # 2026-10-10. That cost ~17 KB of internal heap at idle (24 KB free on
-    # 2.4.7 builds, 7 KB on 2.6.0) - enough that a second API client starved
-    # the device off the network. Pin it until something needs the newer one.
-    components:
-      - name: espressif/esp-sr
-        ref: 2.4.7
+    # esp-sr is pinned to 2.4.7 by voice_frontend itself: 2.6.0 cost ~17 KB of
+    # internal heap at idle, enough that a second API client starved the
+    # device off the network.
     sdkconfig_options:
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
@@ -371,32 +367,17 @@ light:
                             (uint8_t) (current_color.blue * level));
             }
             head = (head + 1) % n;
-      # Whole-ring brightness pulsing with how loud the speaker is playing.
-      # Reads TDM slot 1, the AEC reference tap wired to the ES8311's output
-      # (see the esp_audio_stack block below) - an electrical copy of what is
-      # being played, not a microphone, so it is unaffected by room acoustics
-      # or how loud the mics happen to be. -60/-19 dBFS are this board's
-      # measured idle/playing figures for that slot, same numbers the
-      # tdm_slot_levels sensors below are commented against.
-      #
-      # get_tdm_slot_level_dbfs() is a lock-free atomic read updated by the
-      # audio task on every RX frame (divided by 8, so a few times a second),
-      # independent of whether any tdm_slot_levels sensor is enabled or the
-      # "Debug: audio diagnostics" switch is on - both only gate what gets
-      # published to HA, not whether the level itself is computed.
+      # Whole-ring brightness pulsing with what the speaker is playing. Reads
+      # audio_io's playback meter: computed from the samples on their way to
+      # the DAC every 10 ms, auto-ranged against a slowly falling ceiling, so a
+      # quiet track pulses as fully as a loud one and the volume knob doesn't
+      # change how lively it looks. 0 when nothing plays.
       - addressable_lambda:
           name: "Sound Reactive"
-          update_interval: 60ms
+          update_interval: 30ms
           lambda: |-
-            static float level = 0.0f;
-            if (initial_run) level = 0.0f;
-            float target = (id(audio_stack).get_tdm_slot_level_dbfs(1) + 60.0f) / 45.0f;
-            if (target < 0.0f) target = 0.0f;
-            if (target > 1.0f) target = 1.0f;
-            level += (target - level) * 0.6f;  // one-pole smoothing, tight enough to not read as laggy
-            const float b = 0.05f + level * 0.95f;  // 0.05 floor so the ring outline stays visible when quiet
-            const int n = it.size();
-            for (int i = 0; i < n; i++) {
+            const float b = 0.05f + 0.95f * id(aio).get_playback_meter();  // 0.05 keeps the ring visible
+            for (int i = 0; i < it.size(); i++) {
               it[i] = Color((uint8_t) (current_color.red * b),
                             (uint8_t) (current_color.green * b),
                             (uint8_t) (current_color.blue * b));
@@ -416,7 +397,7 @@ light:
       # room re-establishes the baseline over tens of seconds without speech
       # bursts dragging it up. The floor of the *brightness* (the minimum the
       # ring shows when nobody is talking) is the "Mic Reactive Ground" number
-      # entity. Tune the SNR range against "Diag: TDM slot 0/2" with "Debug:
+      # entity. Tune the SNR range against "Diag: raw mic1/mic2" with "Debug:
       # audio diagnostics" on.
       - addressable_lambda:
           name: "Mic Reactive"
@@ -447,6 +428,23 @@ light:
                             (uint8_t) (current_color.blue * b));
             }
 
+      # One LED per octave band, bass to treble around the ring (100 Hz ..
+      # 6.4 kHz), from the same playback meter as Sound Reactive. Bands share
+      # one auto-ranging ceiling, so the spectrum keeps its shape. Added last so
+      # the earlier effects keep their indices (the stage widgets map by index).
+      - addressable_lambda:
+          name: "Spectrum"
+          update_interval: 30ms
+          lambda: |-
+            const int n = it.size();
+            for (int i = 0; i < n; i++) {
+              const float m = id(aio).get_playback_band_meter((uint8_t) (i * audio_io::NUM_METER_BANDS / n));
+              const float b = 0.03f + 0.97f * m;
+              it[i] = Color((uint8_t) (current_color.red * b),
+                            (uint8_t) (current_color.green * b),
+                            (uint8_t) (current_color.blue * b));
+            }
+
   # Per-stage light widgets: same shape as Status Ring's own card above
   # (color wheel, brightness, power, an effect chip) - one per control_leds
   # state. Turning one on (manually, or control_leds calling
@@ -462,7 +460,7 @@ light:
   # with nothing physical behind it.
   #
   # Effects: Pulse Slow/Medium/Fast really run (harmlessly, into unused
-  # outputs). Rainbow Slow/Wipe/Comet/Sound Reactive/Mic Reactive are
+  # outputs). Rainbow Slow/Wipe/Comet/Sound Reactive/Mic Reactive/Spectrum are
   # no-op stand-ins with the same names - actually rendering any of those
   # needs per-pixel access to a real strip, which only Status Ring has. The
   # names exist so the dropdown offers the full catalog, but a widget's
@@ -471,7 +469,7 @@ light:
   # persists in the effect_* globals (see globals: below) - seeded with the
   # defaults, updated from the widget's on_state whenever it is on (including
   # a deliberate None), and re-applied by control_leds on activation - and
-  # Status Ring's own effects: list (above) declares the same eight names in
+  # Status Ring's own effects: list (above) declares the same nine names in
   # the same order, so the index maps straight across.
   - platform: rgb
     id: light_starting_up
@@ -520,6 +518,10 @@ light:
           lambda: 'return;'
       - lambda:
           name: "Mic Reactive"
+          update_interval: 1s
+          lambda: 'return;'
+      - lambda:
+          name: "Spectrum"
           update_interval: 1s
           lambda: 'return;'
     # Turns off the other 11 widgets and mirrors this one's color/effect/
@@ -1342,11 +1344,11 @@ light:
                 call.set_brightness(id(light_playing_music).remote_values.get_brightness());
                 auto idx = id(light_playing_music).get_current_effect_index();
                 if (idx != 0 || id(last_on_effect_playing_music) != 0) {
-                  id(effect_playing_music) = idx;
+                  id(effect_playing_music_v2) = idx;
                   id(last_on_effect_playing_music) = idx;
                   call.set_effect(idx);
                 } else {
-                  call.set_effect((uint32_t) id(effect_playing_music));
+                  call.set_effect((uint32_t) id(effect_playing_music_v2));
                 }
                 call.perform();
           else:
@@ -1553,165 +1555,96 @@ output:
 # downstream does not change the relationship.
 # ---------------------------------------------------------------------------
 external_components:
-  - source: github://n-IA-hane/esphome-audio-stack@v2026.7.0
-    components: [esp_audio_stack, esp_afe]
   - source: github://traverseda/esphome_snippets@main
-    components: [sap_mic]
+    components: [audio_io, voice_frontend, sap_mic]
 
-# The cleaned-up (post-AEC/NS) mic as a network audio source. It announces
-# itself over SAP, so PipeWire's module-rtp-sap turns it into an input device
-# with no per-device setup (see the README). Off by default and toggled by the
-# "Stream microphone to network" switch: RTP multicast over WiFi goes out at the
-# AP's lowest basic rate, so a stream nobody is listening to still costs airtime.
+# The board's audio, end to end, in our own components (docs/rewrite-plan.md):
+#   audio_io        I2S0 TDM bus, ES7210 4-channel ADC (capture), ES8311 DAC
+#                   (playback, volume on the DAC's own register)
+#   voice_frontend  mic mix -> AEC -> makeup gain -> [NS] -> [AGC]
+# Every number below was measured on alfa, 2026-10-10.
+audio_io:
+  id: aio
+  i2c_id: internal_i2c
+  mclk_pin: $i2s_mclk
+  bclk_pin: $i2s_bclk
+  lrclk_pin: $i2s_lrclk
+  din_pin: GPIO15
+  dout_pin: GPIO16
+  es8311:
+    # 100% volume. The pre-AEC firmware peaked here too (volume_max 0.8 ->
+    # register 0xCC), with the NS4150B still clean.
+    volume_max_db: 6.5
+  es7210:
+    # Maximum analog gain. Room noise peaks around -37 dBFS and nothing clips;
+    # speech still lands ~30 dB under working level, made up digitally below.
+    mic_gain_db: 37.5
+    # Hardware high-pass, picked by ear: 2 best, 3-5 worse, 0 unusable.
+    mic_hpf: 2
+    # The reference is wired to MIC3 (ADC channel 2) but lands in TDM slot 1:
+    # the ES7210 lays its frame out MIC1, MIC3, MIC2, MIC4.
+    ref_adc_channel: 2
+    # Measured with playback: at 0 dB the reference sat ~25 dB under the echo
+    # and AEC removed ~5 dB; 12-24 dB both give ~18 dB.
+    ref_gain_db: 18
+
+voice_frontend:
+  id: vfe
+  audio_io_id: aio
+  mic_mix: average
+  # 6 dB before AEC keeps the speaker's own echo out of clipping (AEC can't
+  # model clipped echo); 24 dB after it brings speech up to the level picked by
+  # ear. "Mic Digital Trim" moves the second one.
+  input_gain_db: 6
+  makeup_gain_db: 24
+  aec:
+    enabled: true
+  # WebRTC NS and AGC each made speech worse in A/B listening, so they start
+  # off. Both stay switchable from HA.
+  ns:
+    enabled: false
+  agc:
+    enabled: false
+
+microphone:
+  # Two channels: 0 = processed output (wake word, STT, network stream),
+  # 1 = debug tap (only sap_mic's debug use reads it).
+  - platform: voice_frontend
+    id: clean_mic
+    voice_frontend_id: vfe
+
+# What STT hears, as a network audio source. It announces itself over SAP, so
+# PipeWire's module-rtp-sap turns it into an input device with no per-device
+# setup (see the README). Off by default and toggled by the "Stream microphone
+# to network" switch: RTP multicast over WiFi goes out at the AP's lowest basic
+# rate, so a stream nobody is listening to still costs airtime.
+#
+# Same source settings as voice_assistant's va_mic, and gain_source keeps its
+# gain factor equal to va_mic's (the "Gain Factor" number), so the stream is the
+# post-AEC/NS audio with the identical gain and clipping HA receives. HA adds
+# nothing after that: noise_suppression_level and auto_gain are 0.
 # Passive - it only forwards what the mic is already capturing, and the mute
 # switch zeroes the gain upstream of it, so muted means a silent stream.
 sap_mic:
   id: network_mic
-  microphone: clean_mic
+  microphone:
+    microphone: clean_mic
+    channels: 0
+  gain_source: va_mic
   enabled: false
 
-esp_afe:
-  id: afe_processor
-  type: sr # wake-word/VA shape rather than the full-duplex fd pipeline
-  mode: low_cost
-  mic_num: 2
-  # SE/BSS is structural for a dual-mic AFE - the component rejects mic_num: 2
-  # without it. It also earns MIC2 its keep: spatial separation of the talker
-  # from everything else in the room.
-  se_enabled: true
-  aec_enabled: true
-  ns_enabled: true
-  # VAD and AGC stay off: micro_wake_word does its own gating, and AGC fights
-  # the analog gain staging on the ES7210 below.
-  vad_enabled: false
-  agc_enabled: false
-  # mic, mic, reference - the slot order after extraction.
-  input_format: mmr
-
-  # The feed and fetch rings default to internal RAM (~24.6 KB and ~8.2 KB).
-  # That is the difference between Bluedroid initialising and not: with them
-  # internal, BLE ran out during btc_init_bluetooth, BTU_StartUp bailed to
-  # BTU_ShutDown, and the teardown path dereferenced structures it had never
-  # allocated - a LoadProhibited panic in l2c_free, on a loop.
-  feed_buf_in_psram: true
-  feed_ring_in_psram: true
-  fetch_ring_in_psram: true
-
-esp_audio_stack:
-  id: audio_stack
-  processor_id: afe_processor
-  # 16k on the wire, which is what this board ran before the migration
-  # ($i2s_sample_rate was 16000) - so this is the known-good clocking, not a
-  # downgrade. The media pipelines still decode at 48k and the resampler
-  # speakers below bring them down, exactly as they always did.
-  #
-  # Running the bus at 48k instead costs three times the buffer memory on every
-  # stage and forces a 3-channel rate converter across the TDM frame, which is
-  # what the first two attempts died on. ESP-SR wants 16k regardless, so the
-  # upsample bought nothing.
-  sample_rate: 16000
-  output_sample_rate: 16000
-  # 32-bit slots: the ES7210 clocks TDM at 32 bits per slot regardless of how
-  # many bits actually carry signal.
-  bits_per_sample: 32
-  slot_bit_width: 32
-
-  i2s_mclk_pin: $i2s_mclk
-  i2s_bclk_pin: $i2s_bclk
-  i2s_lrclk_pin: $i2s_lrclk
-  i2s_din_pin: GPIO15
-  i2s_dout_pin: GPIO16
-
-  # Measured, not read off the schematic. Playing music and watching the slot
-  # level sensors: slot 1 sits at -60 dBFS when nothing plays - well below the
-  # room noise slot 0 hears - then jumps to -19 dBFS the moment playback starts,
-  # a 41 dB swing. That is an electrical tap, not a microphone. Slot 0 moves
-  # only 11 dB and hears the room constantly, which is what a mic does.
-  #
-  # So the ES7210 does not lay its channels across the TDM frame in MIC1..MIC4
-  # order. The frame is MIC1, MIC3, MIC2, MIC4 - the reference sits between the
-  # two mics. Same layout as the component's own ES7210 example, which is worth
-  # believing over the schematic's channel numbering.
-  use_tdm_reference: true
-  tdm_total_slots: 4
-  tdm_mic_slots: [0, 2]
-  tdm_ref_slot: 1 # the AEC tap
-  tdm_tx_slot: 0
-
-  # Not optional on this board. The frame buffers scale with slots x bit depth
-  # x resample ratio, and four 32-bit slots at 48k feeding a 16k processor works
-  # out to about 219 KB - rx, tdm_tx, tx_clock and tx_32 are ~49 KB each. The
-  # default is MALLOC_CAP_INTERNAL, and there is nowhere near that much internal
-  # RAM left once ESP-SR, the wifi buffers, BLE and the wake-word model have
-  # taken theirs: the first attempt died on "Audio buffer preallocation failed"
-  # with 140 KB free and a 131 KB largest block. These are not DMA buffers - the
-  # I2S descriptors are allocated separately by the IDF driver - so PSRAM is a
-  # correct home for them, and there are 5.3 MB of it going spare.
-  buffers_in_psram: true
-  audio_task_stack_in_psram: true
-
-  # No master_volume_min_db here, and that is deliberate - it is the wrong knob
-  # and it was set to -30 for a while on the theory that it was the right one.
-  # It only shapes the *hardware* master curve, i.e. the optional
-  # `number: platform: esp_audio_stack, master_volume:` entity, which this
-  # package does not create and which therefore sits pinned at 100% = 0 dB.
-  #
-  # The media player's volume never reaches that path. It runs
-  # resampler -> mixer -> this speaker -> ESPAudioStack::set_output_volume(),
-  # a software q31 gain whose floor is the component's hardcoded
-  # SOFTWARE_VOLUME_MIN_DB of -49 dB, linear in dB from there to 0 dB at 1.0.
-  # See the volume_min/volume_max comment on the media player below for what
-  # that costs against the old audio_dac path and why the limits changed.
-
-  codec:
-    i2c_id: internal_i2c
-    input:
-      type: es7210
-      address: 0x40
-      gain_db: 30.0
-      # Per-channel override for the reference: the divider already puts the
-      # tap at line level, so it must not get the mics' 30 dB of PGA or it
-      # clips and AEC has nothing usable to subtract.
-      #
-      # This is NOT tdm_ref_slot and must not be kept in sync with it. It is a
-      # physical ES7210 ADC channel (MIC1=0 .. MIC4=3) passed to
-      # esp_codec_dev_set_in_channel_gain, whereas tdm_ref_slot is a position in
-      # the TDM frame. On this board the reference is MIC3, i.e. channel 2, but
-      # it lands in frame slot 1. Setting this to 1 to "match" hands the 0 dB
-      # override to MIC2 instead and leaves the second mic 30 dB down.
-      ref_channel: 2
-      ref_gain_db: 0.0
-    output:
-      type: es8311
-      address: 0x18
-      use_mclk: true
-
-microphone:
-  - platform: esp_audio_stack
-    id: clean_mic
-    esp_audio_stack_id: audio_stack
-
 speaker:
-  - platform: esp_audio_stack
-    id: i2s_audio_speaker
-    esp_audio_stack_id: audio_stack
-    timeout: never
+  - platform: audio_io
+    id: board_speaker
+    audio_io_id: aio
     buffer_duration: 500ms
-    # The platform deliberately leaves sample_rate unset - it plays at whatever
-    # the bus runs at, resolved in C++ at setup(). The mixer below needs a
-    # concrete rate at config time, so state the bus rate explicitly. Keep this
-    # equal to esp_audio_stack's sample_rate. Same story for bits_per_sample:
-    # the platform clamps to 16-bit either way, but the mixer wants it stated.
-    sample_rate: 16000
-    bits_per_sample: 16
 
   # Virtual speakers to combine the announcement and sendspin streams into one
   # output. There is no media input any more: music only ever arrives through
   # the sendspin stream, so the local media pipeline that used to feed this
   # mixer (and the media_mixing_input/media_resampling_speaker it owned) is gone.
   #
-  # Mono, not stereo: a TDM bus places playback in tdm_tx_slot, so the stack
-  # disables stereo TX and the mixer has to match. No loss on this board - there
+  # Mono, not stereo: audio_io's speaker is mono. No loss on this board - there
   # is one NS4150B driving one speaker off PA_OUTL+/-.
   #
   # Task stacks live in PSRAM, not internal RAM. This device runs on a razor's
@@ -1726,7 +1659,7 @@ speaker:
   # these stacks in PSRAM preserves the internal headroom the TLS path needs.
   - platform: mixer
     id: mixing_speaker
-    output_speaker: i2s_audio_speaker
+    output_speaker: board_speaker
     num_channels: 1
     task_stack_in_psram: true
     source_speakers:
@@ -2104,7 +2037,8 @@ globals:
     initial_value: 'false'
   # Persisted per-stage effect, one int per widget, as an index into the
   # shared effects list (None=0, Pulse Slow=1, Pulse Medium=2, Pulse Fast=3,
-  # Rainbow Slow=4, Wipe=5, Comet=6, Sound Reactive=7, Mic Reactive=8 - the
+  # Rainbow Slow=4, Wipe=5, Comet=6, Sound Reactive=7, Mic Reactive=8,
+  # Spectrum=9 - the
   # same order Status Ring declares them, so the index maps straight across).
   # A light's own effect can't be the source of truth: ESPHome clears any
   # effect the moment the light turns off, so the widget never keeps one.
@@ -2157,10 +2091,12 @@ globals:
     type: int
     restore_value: yes
     initial_value: '3'
-  - id: effect_playing_music
+  # Spectrum (9) by default. The _v2 id is deliberate: globals restore by id,
+  # so a fresh id is what moves speakers that already stored the old default.
+  - id: effect_playing_music_v2
     type: int
     restore_value: yes
-    initial_value: '1'
+    initial_value: '9'
   # Transient per-widget fresh-turn-on tracker: the effect this widget was
   # running at its most recent on_state while on, cleared to 0 whenever the
   # widget turns off. Lets on_state tell a deliberate "None" selection (the
@@ -2217,13 +2153,6 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
-  # Which TDM slot the audio stack is currently using as the AEC reference, so
-  # debug_ref_slot can skip the bus restart when the value has not actually
-  # changed. Must match tdm_ref_slot in the esp_audio_stack block.
-  - id: active_ref_slot
-    type: int
-    restore_value: no
-    initial_value: '1'
   - id: init_in_progress
     type: bool
     restore_value: no
@@ -2456,7 +2385,7 @@ script:
           // mute should still be visible over quiet background music.
           if (playing_music) {
             auto call = id(light_playing_music).turn_on();
-            call.set_effect((uint32_t) id(effect_playing_music));
+            call.set_effect((uint32_t) id(effect_playing_music_v2));
             call.perform();
             return;
           }
@@ -2792,20 +2721,43 @@ switch:
     entity_category: config
     restore_mode: RESTORE_DEFAULT_OFF
 
-  # A runtime A/B for the front end. Turning AEC off is the fastest way to tell
+  # Runtime A/B for the front end. Turning AEC off is the fastest way to tell
   # "the wake word got worse because the canceller is misconfigured" apart from
   # "the wake word got worse for some other reason" - flip it while music plays
-  # and see whether detection changes.
-  - platform: esp_afe
-    esp_afe_id: afe_processor
-    aec:
-      name: "Echo Cancellation"
-      entity_category: config
-      restore_mode: RESTORE_DEFAULT_ON
-    ns:
-      name: "Noise Suppression"
-      entity_category: config
-      restore_mode: RESTORE_DEFAULT_ON
+  # and see whether detection changes. Every stage bypasses without stopping
+  # the stream. Saved switch states are keyed by name, so NS and AGC carry
+  # names the old esp_afe switches never used - otherwise the old firmware's
+  # stored "on" would be restored.
+  - platform: template
+    id: fe_aec
+    name: "Echo Cancellation"
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: return id(vfe).is_aec_enabled();
+    turn_on_action:
+      - lambda: id(vfe).set_aec_enabled(true);
+    turn_off_action:
+      - lambda: id(vfe).set_aec_enabled(false);
+  - platform: template
+    id: fe_ns
+    name: "WebRTC Noise Suppression"
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: return id(vfe).is_ns_enabled();
+    turn_on_action:
+      - lambda: id(vfe).set_ns_enabled(true);
+    turn_off_action:
+      - lambda: id(vfe).set_ns_enabled(false);
+  - platform: template
+    id: fe_agc
+    name: "WebRTC Automatic Gain Control"
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: return id(vfe).is_agc_enabled();
+    turn_on_action:
+      - lambda: id(vfe).set_agc_enabled(true);
+    turn_off_action:
+      - lambda: id(vfe).set_agc_enabled(false);
 
   - platform: gpio
     id: amp_enable_8
@@ -2841,19 +2793,16 @@ switch:
     turn_on_action:
       - lambda: |-
           id(mic_is_muted) = true;
-          id(audio_stack).set_mic_gain(0.0f);
+          id(vfe).set_muted(true);
       - script.execute:
           id: flash_ring
           r: 1.0
           g: 0.0
           b: 0.0
     turn_off_action:
-      # Unmute restores the trim the number entity holds. It used to restore a
-      # separate mic_gain_saved global that nothing ever wrote to, so unmuting
-      # always jumped to that global's initial 32 dB regardless of the setting.
       - lambda: |-
           id(mic_is_muted) = false;
-          id(audio_stack).set_mic_gain(powf(10.0f, id(mic_digital_trim_db).state / 20.0f));
+          id(vfe).set_muted(false);
       # The measured purple the voice phases use - the ring is listening again.
       - script.execute:
           id: flash_ring
@@ -2959,86 +2908,27 @@ number:
     step: 1
     restore_value: true
     initial_value: 0
-    # Muted wins, same as before: a device that boots muted stays muted.
+    # Offsets voice_frontend's makeup gain (24 dB, after AEC). Mute is separate
+    # (set_muted), so the trim survives a mute/unmute.
     on_value:
       - lambda: |-
-          id(audio_stack).set_mic_gain(id(mic_is_muted) ? 0.0f : powf(10.0f, x / 20.0f));
+          id(vfe).set_makeup_gain_db(24.0f + x);
       - logger.log:
           format: "[MIC] Set post-AEC digital trim to %.0f dB"
           args: ["x"]
-  # Live reference-slot switch, for finding the AEC reference without a reflash.
-  #
-  # Which TDM slot carries the playback reference is not something the schematic
-  # answers: the ES7210 lays its channels across the frame as MIC1, MIC3, MIC2,
-  # MIC4, so the reference sits in slot 1 even though it is wired to channel 3.
-  # Getting that wrong is silent - AEC subtracts a microphone from a microphone
-  # and simply does nothing, with no error anywhere.
-  #
-  # CHANGING THIS STOPS PLAYBACK. Switching the reference slot has to tear the
-  # I2S bus down and bring it back, and whatever the media player was streaming
-  # does not survive that - the hardware recovers, the audio does not resume.
-  # So the measurement loop is: set the slot, THEN start playing, then read.
-  # Comparing slots means restarting playback each time, and any reading taken
-  # without audio actually playing is meaningless - with the room quiet, input
-  # and output both sit near the noise floor and their difference is noise.
-  #
-  # Workflow: turn on "Debug: audio diagnostics", set this slot, start music,
-  # then watch "Diag: AFE output RMS" against "Diag: AFE input volume". The
-  # correct slot is the one where output drops ~20 dB below input while audio is
-  # definitely playing. Check the input level looks like playback (about -33
-  # dBFS here) and not idle (about -53) before believing any of it.
-  #
-  # set_action, not on_value: this must fire only when somebody actually moves
-  # it, never from a restore or the initial publish, or the device would tear
-  # the audio path down mid-boot. It is deliberately not restored across
-  # reboots either - a stored wrong value would silently disable AEC on every
-  # boot, which is exactly the failure this control exists to diagnose.
+  # voice_frontend already delivers speech at working level, so the old x4
+  # would clip it. New name (saved values are keyed by name), so the 4 stored
+  # by the old firmware isn't restored.
   - platform: template
-    id: debug_ref_slot
-    name: "Debug: AEC reference slot"
-    icon: mdi:swap-horizontal
-    entity_category: config
-    min_value: 0
-    max_value: 3
-    step: 1
-    restore_value: false
-    initial_value: 1
-    set_action:
-      - lambda: id(debug_ref_slot).publish_state(x);
-      # Writing the value it already holds must not tear anything down. HA and
-      # scripts both re-send the current value freely, and an unguarded restart
-      # here kills playback for no reason - which is exactly how the first
-      # attempt at measuring this destroyed its own test conditions.
-      - if:
-          condition:
-            lambda: return ((int) x) != id(active_ref_slot);
-          then:
-            # Release the mic before tearing the bus down - consumers are
-            # reference-counted, so stop_and_wait will not stop a stack that
-            # mWW is still holding.
-            - micro_wake_word.stop:
-            - delay: 150ms
-            - lambda: |-
-                const uint8_t slot = (uint8_t) id(debug_ref_slot).state;
-                id(audio_stack).stop_and_wait();
-                id(audio_stack).set_tdm_ref_slot(slot);
-                id(audio_stack).start();
-                id(active_ref_slot) = (int) slot;
-                ESP_LOGW("aec", "[DEBUG] reference slot now %u - playback was stopped by the "
-                                "bus restart, start audio again before reading AFE levels", slot);
-            - delay: 250ms
-            - micro_wake_word.start:
-
-  - platform: template
-    id: va_gain_factor
-    name: "Gain Factor"
+    id: stt_gain_factor
+    name: "STT Gain Factor"
     entity_category: config
     optimistic: true
     min_value: 1
     max_value: 64
     step: 1
     restore_value: true
-    initial_value: 4
+    initial_value: 1
     on_value:
       - lambda: |-
           id(va_mic).set_gain_factor(x);
@@ -3251,56 +3141,54 @@ sensor:
   #     name: "Peak sound level"
   #     id: peak_sound_level
 
-  # Bring-up instruments for the TDM slot mapping. The slot assignments in the
-  # esp_audio_stack block are read off the schematic, not measured, and the
-  # whole thing is silently useless if they are wrong: AEC would be subtracting
-  # a mic from a mic. These answer it empirically.
-  #
-  # Play music with nobody talking: slot 2 should move and slots 0/1 should not.
-  # Then talk with nothing playing: slots 0 and 1 should move and slot 2 should
-  # not. Slot 3 should sit still throughout - nothing drives MIC4 on this board.
-  #
-  # Remove these once the mapping is confirmed; they are four more states a
-  # minute into the recorder for no ongoing benefit.
-  # All six are gated on the debug_audio switch: the lambda returning an empty
-  # optional drops the reading, so nothing publishes while debug is off.
-  - platform: esp_audio_stack
-    esp_audio_stack_id: audio_stack
-    tdm_slot_levels:
-      - slot: 0
-        name: "Diag: TDM slot 0 (MIC1)"
-        entity_category: diagnostic
-        filters: &debug_gated
-          - lambda: |-
-              if (!id(debug_audio).state) return {};
-              return x;
-      - slot: 1
-        name: "Diag: TDM slot 1 (MIC3 = AEC ref)"
-        entity_category: diagnostic
-        filters: *debug_gated
-      - slot: 2
-        name: "Diag: TDM slot 2 (MIC2)"
-        entity_category: diagnostic
-        filters: *debug_gated
-      - slot: 3
-        name: "Diag: TDM slot 3 (MIC4, unpopulated)"
-        entity_category: diagnostic
-        filters: *debug_gated
-
-  - platform: esp_afe
-    esp_afe_id: afe_processor
-    # The pair that tells you whether AEC is doing anything: with the speaker
-    # playing, output_rms should sit well below input_volume. About 20 dB below
-    # on this board when the reference slot is right; within a couple of dB
-    # means the canceller is subtracting the wrong channel.
-    input_volume:
-      name: "Diag: AFE input volume"
-      entity_category: diagnostic
-      filters: *debug_gated
-    output_rms:
-      name: "Diag: AFE output RMS"
-      entity_category: diagnostic
-      filters: *debug_gated
+  # Audio diagnostics, all gated on the debug_audio switch (the lambda filter
+  # drops the reading while it's off). Raw ADC levels per channel, then the
+  # front end either side of AEC: with the speaker playing, "after AEC" should
+  # sit ~18 dB under "before AEC"; within a couple of dB means the reference is
+  # wrong or too quiet.
+  - platform: template
+    name: "Diag: raw mic1"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: return id(aio).get_stats(audio_io::CH_MIC1).rms_dbfs;
+    filters: &debug_gated
+      - lambda: |-
+          if (!id(debug_audio).state) return {};
+          return x;
+  - platform: template
+    name: "Diag: raw mic2"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: return id(aio).get_stats(audio_io::CH_MIC2).rms_dbfs;
+    filters: *debug_gated
+  - platform: template
+    name: "Diag: raw AEC reference"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: return id(aio).get_stats(audio_io::CH_REF).rms_dbfs;
+    filters: *debug_gated
+  - platform: template
+    name: "Diag: front end before AEC"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: return id(vfe).get_stage_level(voice_frontend::Tap::MIX);
+    filters: *debug_gated
+  - platform: template
+    name: "Diag: front end after AEC"
+    unit_of_measurement: dBFS
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: return id(vfe).get_stage_level(voice_frontend::Tap::AEC);
+    filters: *debug_gated
 
 text_sensor:
   - platform: template

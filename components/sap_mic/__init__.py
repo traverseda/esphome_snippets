@@ -11,6 +11,7 @@ CONF_GROUP = "group"
 CONF_PACKET_MS = "packet_ms"
 CONF_BUFFER_MS = "buffer_ms"
 CONF_ENABLED = "enabled"
+CONF_GAIN_SOURCE = "gain_source"
 
 sap_mic_ns = cg.esphome_ns.namespace("sap_mic")
 SapMic = sap_mic_ns.class_("SapMic", cg.Component)
@@ -26,7 +27,12 @@ def _multicast_ipv4(value):
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(SapMic),
-        cv.Required(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
+        # A microphone source, same shape as voice_assistant's, so the stream can
+        # be put through exactly the processing another consumer's audio gets.
+        cv.Required(CONF_MICROPHONE): microphone.microphone_source_schema(max_channels=3),
+        # Keep this source's gain factor equal to another source's (e.g. the
+        # voice assistant's), so the stream follows it when it changes at runtime.
+        cv.Optional(CONF_GAIN_SOURCE): cv.use_id(microphone.MicrophoneSource),
         # What the stream is called on the receiving end. Defaults to
         # "<friendly_name> mic".
         cv.Optional(CONF_SESSION_NAME): cv.string_strict,
@@ -41,13 +47,24 @@ CONFIG_SCHEMA = cv.Schema(
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
+FINAL_VALIDATE_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_MICROPHONE): microphone.final_validate_microphone_source_schema("sap_mic"),
+    },
+    extra=cv.ALLOW_EXTRA,
+)
+
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    mic = await cg.get_variable(config[CONF_MICROPHONE])
-    cg.add(var.set_microphone(mic))
+    # Passive: never starts capture, only forwards audio someone else asked for.
+    mic_source = await microphone.microphone_source_to_code(config[CONF_MICROPHONE], passive=True)
+    cg.add(var.set_microphone_source(mic_source))
+    if CONF_GAIN_SOURCE in config:
+        gain_source = await cg.get_variable(config[CONF_GAIN_SOURCE])
+        cg.add(var.set_gain_source(gain_source))
     if CONF_SESSION_NAME in config:
         cg.add(var.set_session_name(config[CONF_SESSION_NAME]))
     if CONF_GROUP in config:

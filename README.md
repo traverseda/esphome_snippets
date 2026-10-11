@@ -68,25 +68,34 @@ substitutions:
 
 ## Smart speaker
 
-Needs ESPHome 2026.7.0+ and `framework: esp-idf`. The audio path runs on the
-[esphome-audio-stack](https://github.com/n-IA-hane/esphome-audio-stack) external
-component instead of ESPHome's `i2s_audio`, so that acoustic echo cancellation
-can use the board's hardware echo reference — the Waveshare schematic feeds the
-ES8311's output back into ES7210 channel 3 through a divider, and ESPHome's own
-ES7210 driver cannot read it because it does not do TDM. Without this the device
-goes deaf whenever it is playing anything.
+Needs ESPHome 2026.7.0+ and `framework: esp-idf`. The audio path runs on two
+components in this repo, `audio_io` and `voice_frontend`, instead of ESPHome's
+`i2s_audio`. The point is acoustic echo cancellation against the board's
+hardware echo reference: the Waveshare schematic feeds the ES8311's output back
+into ES7210 channel 3 through a divider, and ESPHome's own ES7210 driver can't
+read it because it doesn't do TDM. Without echo cancellation the device goes
+deaf whenever it plays anything.
 
-That component is young and has one maintainer, so consider pinning a ref rather
-than tracking `main` (see "To stop tracking `main`" below) if you want
-reproducible builds.
+- **`audio_io`** owns the I2S TDM bus and both codecs: the ES7210 for the mics
+  and the echo reference, and the ES8311 for playback. Volume is set on the
+  ES8311's own register, so 100% is +6.5 dB, the same as the pre-AEC firmware.
+  Its speaker is a stock ESPHome speaker, so the mixer, media players and
+  sendspin are unchanged.
+- **`voice_frontend`** turns the two mics into what the wake word and STT hear:
+  the mics averaged, then echo cancellation (esp-sr, pinned to 2.4.7), then
+  digital gain. WebRTC noise suppression and AGC are built in but off by
+  default, because both made speech worse in listening tests. Every stage can
+  be switched from HA without interrupting the stream.
 
-One thing the AEC path costs you is headroom. The old `i2s_audio` speaker handed
-the volume to the ES8311's own register, which goes to +32 dB, and full volume
-landed at +6.5 dB. `esp_audio_stack` applies volume as a software gain that
-stops at unity and clamps its codec curve at 0 dB, so the loudest this package
-can now get is 6.5 dB below the pre-AEC firmware. `volume_max: 1.0` recovers
-everything else. Lifting that ceiling needs a change in the audio-stack
-component, not in this file.
+Every gain and filter setting was measured on the board, and the comments next
+to each one in `smart-speak.yaml` give the numbers. `docs/rewrite-plan.md` has
+the plan this came from, and `tools/capture.py` records and analyses the mic
+stream (see below).
+
+The previous audio path, the
+[esphome-audio-stack](https://github.com/n-IA-hane/esphome-audio-stack)
+component with the esp-sr AFE, is at `ref: ce0832e`. It reached 100% volume at
+0 dB, 6.5 dB quieter than now, and it left about 40 KB less internal heap free.
 
 To go back to the pre-AEC audio path — ESPHome's own `i2s_audio` with the
 patched ES8311, one microphone, no echo cancellation, and the BLE beacon proxy
@@ -177,6 +186,13 @@ To debug the audio front end, record it and open it in Audacity:
 pw-record --target "speaker-alfa mic" --rate 16000 --channels 1 capture.wav
 ```
 
+Or record straight off the network, with levels, hum and speech-band figures
+printed per channel (no PipeWire needed):
+
+```sh
+tools/capture.py 239.69.<ip3>.<ip4> 10 capture.wav
+```
+
 ## Known limitation: a TV in the room
 
 **Symptom.** Say the wake word while a TV is playing dialogue and the command
@@ -213,7 +229,10 @@ the command and it runs to the 15 s timeout.
 ### What does not work, and why
 
 Checked against ESPHome 2026.7.3, esp-sr 2.4.7, esphome-audio-stack v2026.7.0,
-HA 2026.7.4, on 2026-07-29. Recorded so nobody re-treads these.
+HA 2026.7.4, on 2026-07-29. Recorded so nobody re-treads these. Since
+2026-10-10 the device runs its own front end (`voice_frontend`, no BSS). The
+reasoning below still holds, but the component-specific blockers now apply to
+code in this repo.
 
 - **AEC.** Cancels only what the device itself plays, because that is the only
   signal it has a reference for. A TV is uncorrelated. Works beautifully for its

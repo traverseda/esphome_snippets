@@ -2,7 +2,7 @@
 
 #ifdef USE_ESP32
 
-#include "esphome/components/microphone/microphone.h"
+#include "esphome/components/microphone/microphone_source.h"
 #include "esphome/core/component.h"
 
 #include <freertos/FreeRTOS.h>
@@ -26,7 +26,8 @@ class SapMic : public Component {
   void on_shutdown() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
-  void set_microphone(microphone::Microphone *mic) { this->mic_ = mic; }
+  void set_microphone_source(microphone::MicrophoneSource *source) { this->source_ = source; }
+  void set_gain_source(microphone::MicrophoneSource *source) { this->gain_source_ = source; }
   void set_session_name(const std::string &name) { this->session_name_ = name; }
   void set_group(const std::string &group) { this->group_config_ = group; }
   void set_port(uint16_t port) { this->port_ = port; }
@@ -40,12 +41,14 @@ class SapMic : public Component {
 
  protected:
   void on_audio_(const std::vector<uint8_t> &data);
+  void drain_();
   bool open_socket_();
   void build_announcement_(uint32_t local_ip);
   void send_sap_(bool deletion);
   void send_rtp_();
 
-  microphone::Microphone *mic_{nullptr};
+  microphone::MicrophoneSource *source_{nullptr};
+  microphone::MicrophoneSource *gain_source_{nullptr};
   std::string session_name_;
   std::string group_config_;
   uint16_t port_{46000};
